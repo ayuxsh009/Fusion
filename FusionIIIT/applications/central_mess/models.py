@@ -333,4 +333,96 @@ class Update_Payment(models.Model):
     payment_date= models.DateField(default=None, null=True)
     def __str__(self):
         return str(self.student_id.id)
-    
+
+
+class VacationSurvey(models.Model):
+    """A survey for vacation food preferences, created by caretaker."""
+    title = models.CharField(max_length=200)
+    description = models.TextField(blank=True, default="")
+    vacation_start = models.DateField()
+    vacation_end = models.DateField()
+    mess_option = models.CharField(max_length=20, choices=MESS_OPTION + (('all', 'All'),), default='all')
+    is_active = models.BooleanField(default=True)
+    created_by = models.ForeignKey(
+        'globals.ExtraInfo', on_delete=models.SET_NULL, null=True, blank=True
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ['-created_at']
+
+    def __str__(self):
+        return self.title
+
+
+class VacationSurveyResponse(models.Model):
+    """A student's response to a vacation survey."""
+    RESPONSE_CHOICES = (
+        ('staying', 'Staying on campus, will need food'),
+        ('leaving', 'Leaving campus, will not need food'),
+        ('undecided', 'Not decided yet'),
+    )
+    survey = models.ForeignKey(VacationSurvey, on_delete=models.CASCADE, related_name='responses')
+    student_id = models.ForeignKey(Student, on_delete=models.CASCADE)
+    response = models.CharField(max_length=20, choices=RESPONSE_CHOICES)
+    remarks = models.TextField(blank=True, default="")
+    responded_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        unique_together = (('survey', 'student_id'),)
+
+    def __str__(self):
+        return f"{self.student_id} → Survey {self.survey_id}: {self.response}"
+
+
+class MenuPoll(models.Model):
+    """A poll for students to vote on preferred menu items."""
+    question = models.CharField(max_length=300)
+    option1 = models.CharField(max_length=100)
+    option2 = models.CharField(max_length=100)
+    option3 = models.CharField(max_length=100, blank=True, default="")
+    option4 = models.CharField(max_length=100, blank=True, default="")
+    mess_option = models.CharField(max_length=20, choices=MESS_OPTION + (('all', 'All'),), default='all')
+    is_active = models.BooleanField(default=True)
+    created_by = models.ForeignKey(
+        'globals.ExtraInfo', on_delete=models.SET_NULL, null=True, blank=True
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+    end_date = models.DateField(null=True, blank=True)
+
+    class Meta:
+        ordering = ['-created_at']
+
+    def __str__(self):
+        return self.question
+
+
+class MenuPollVote(models.Model):
+    """A student's vote in a menu poll."""
+    poll = models.ForeignKey(MenuPoll, on_delete=models.CASCADE, related_name='votes')
+    student_id = models.ForeignKey(Student, on_delete=models.CASCADE)
+    selected_option = models.PositiveSmallIntegerField()  # 1, 2, 3, or 4
+    voted_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        unique_together = (('poll', 'student_id'),)
+
+    def __str__(self):
+        return f"{self.student_id} → Poll {self.poll_id} Option {self.selected_option}"
+
+
+class Announcement(models.Model):
+    title = models.CharField(max_length=200)
+    content = models.TextField()
+    mess_option = models.CharField(max_length=20, choices=MESS_OPTION + (('all', 'All'),), default='all')
+    created_by = models.ForeignKey(
+        'globals.ExtraInfo', on_delete=models.SET_NULL, null=True, blank=True
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ['-created_at']
+
+    def __str__(self):
+        return self.title

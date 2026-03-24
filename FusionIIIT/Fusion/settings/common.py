@@ -89,7 +89,11 @@ CELERY_BEAT_SCHEDULE = {
     'leave-migration-task': {
         'task': 'applications.leave.tasks.execute_leave_migrations',
         'schedule': crontab(minute='1', hour='0')
-    }
+    },
+    'generate-mess-bill-monthly': {
+        'task': 'applications.central_mess.tasks.generate_mess_bill',
+        'schedule': crontab(minute='0', hour='2', day_of_month='1'),
+    },
 }
 
 # Application definition

@@ -20,10 +20,13 @@ COPY requirements.txt $FUSION_HOME
 # install dependencies  
 RUN pip install --upgrade pip && pip install -r requirements.txt
 
-# copy api directory to docker's work directory. 
+# copy api directory to docker's work directory.
 COPY . $FUSION_HOME
 
-# port where the Django app runs  
+# make entrypoint executable
+RUN chmod +x docker-entrypoint.sh
+
+# port where the Django app runs
 EXPOSE 8000
 
 # start server  

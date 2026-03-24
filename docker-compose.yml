@@ -4,7 +4,7 @@ services:
     image: postgres:13-alpine
     restart: always
     volumes:
-      - ~/private/var/lib/postgresql:/var/lib/postgresql/data
+      - ~/private/var/lib/postgresql:/var/lib/postgresql/data:Z
     environment:
       - PGDATA=/var/lib/postgresql/data/some_name/ 
       - POSTGRES_DB=fusionlab
@@ -18,10 +18,10 @@ services:
       dockerfile: Dockerfile
     restart: always
     volumes:
-      - .:/home/app
+      - .:/home/app:Z
     ports:
       - 8000:8000
-    command: /bin/bash docker-entrypoint.sh
+    command: python FusionIIIT/manage.py runserver 0.0.0.0:8000
     environment:
       - DB_HOST=db
     depends_on:

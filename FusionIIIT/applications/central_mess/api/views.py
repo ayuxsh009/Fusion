@@ -1,943 +1,761 @@
-    #APIs
-from datetime import date, datetime, timedelta
-from django.db.models import F
-from rest_framework.views import APIView
+from rest_framework import status
+from rest_framework.parsers import FormParser, MultiPartParser
 from rest_framework.response import Response
-# from FusionIIIT.notification.views import central_mess_notif
-from .serializers import *
-from django.shortcuts import get_object_or_404
-from applications.central_mess.models import *
-from django.contrib.auth.models import User
-from applications.globals.models import ExtraInfo, HoldsDesignation, Designation
-from django.http import JsonResponse
+from rest_framework.views import APIView
 
-today_g = datetime.datetime.now()
+from applications.central_mess.selectors import (
+    get_announcement_queryset,
+    get_deregistration_request_queryset,
+    get_poll_queryset,
+    get_vacation_survey_queryset,
+    get_feedback_queryset,
+    get_menu_change_request_queryset,
+    get_menu_queryset,
+    get_mess_bill_base_queryset,
+    get_mess_meeting_queryset,
+    get_mess_minutes_queryset,
+    get_mess_reg_queryset,
+    get_messinfo_queryset,
+    get_monthly_bill_queryset,
+    get_payments_queryset,
+    get_rebate_queryset,
+    get_reg_main_by_student_id,
+    get_reg_main_for_student,
+    get_reg_main_queryset,
+    get_reg_records_queryset,
+    get_registration_request_queryset,
+    get_special_request_queryset,
+    get_student_from_request_user,
+    get_update_payment_request_queryset,
+    get_vacation_food_queryset,
+)
+from applications.central_mess.services import (
+    CentralMessServiceError,
+    RebateOverlapError,
+    admin_deregister_all_from_mess,
+    admin_deregister_student,
+    admin_register_student,
+    close_menu_poll,
+    create_announcement,
+    create_menu_poll,
+    create_vacation_survey,
+    submit_poll_vote,
+    submit_survey_response,
+    create_deregistration_request,
+    create_feedback,
+    create_menu,
+    create_menu_change_request,
+    create_mess_bill_base,
+    create_mess_meeting,
+    create_mess_minutes,
+    create_messinfo,
+    create_mess_reg,
+    create_monthly_bill,
+    create_rebate,
+    create_registration_request,
+    create_special_request,
+    create_update_payment_request,
+    create_vacation_food,
+    delete_deregistration_request,
+    decide_deregistration_request,
+    decide_registration_request,
+    decide_update_payment_request,
+    delete_announcement,
+    delete_feedback,
+    process_excel_bill_update,
+    update_feedback_status,
+    update_menu_items,
+    update_rebate_status,
+    update_special_request_status,
+    update_vacation_food_status,
+)
+
+from .serializers import (
+    AnnouncementSerializer,
+    MenuPollSerializer,
+    MenuPollVoteSerializer,
+    VacationSurveySerializer,
+    VacationSurveyResponseSerializer,
+    DeregistrationDecisionSerializer,
+    DeregistrationDeleteSerializer,
+    DeregistrationRequestSerializer,
+    FeedbackSerializer,
+    FeedbackStatusUpdateSerializer,
+    GetFilteredSerialzer,
+    MenuSerializer,
+    Menu_change_requestSerializer,
+    Mess_meetingSerializer,
+    Mess_minutesSerializer,
+    Mess_regSerializer,
+    MessBillBaseSerializer,
+    MessinfoSerializer,
+    Monthly_billSerializer,
+    PaymentsSerializer,
+    RebateSerializer,
+    RebateStatusUpdateSerializer,
+    RegistrationDecisionSerializer,
+    RegistrationRequestSerializer,
+    Special_requestSerializer,
+    SpecialRequestStatusUpdateSerializer,
+    UpdatePaymentDecisionSerializer,
+    UpdatePaymentRequestSerializer,
+    Vacation_foodSerializer,
+    VacationFoodStatusUpdateSerializer,
+    reg_recordSerialzer,
+)
+
 
 class FeedbackApi(APIView):
 
     def get(self, request):
-        feedback_obj = Feedback.objects.all();
+        feedback_obj = get_feedback_queryset()
         serialized_obj = FeedbackSerializer(feedback_obj, many=True)
-        return Response({'status':200, 'payload':serialized_obj.data})
+        return Response({'status': 200, 'payload': serialized_obj.data})
 
     def post(self, request):
-        data = request.data
-        
-        mess = data['mess']
-        feedback_type = data['feedback_type']
-        description = data['description']
-        username = get_object_or_404(User,username=request.user.username)
-        idd = ExtraInfo.objects.get(user=username)
-        student = Student.objects.get(id=idd.id)
-        obj = Feedback(
-            student_id = student,
-            mess =mess,
-            feedback_type=feedback_type,
-            description=description
-        )
-        obj.save()
-        return Response({'status':200})
-    
+        serializer = FeedbackSerializer(data=request.data)
+        if serializer.is_valid():
+            create_feedback(serializer.validated_data, request_user=request.user)
+            return Response({'status': 200})
+        return Response(serializer.errors, status=400)
+
     def put(self, request):
-        data = request.data
+        serializer = FeedbackStatusUpdateSerializer(data=request.data)
+        if serializer.is_valid():
+            update_feedback_status(serializer.validated_data)
+            return Response({'status': 200})
+        return Response(serializer.errors, status=400)
 
-        print(data)
-        
-        student_id = data['student_id']
-        mess = data['mess']
-        feedback_type = data['feedback_type']
-        description = data['description']
-        fdate = data['fdate']
-        new_remark = data['feedback_remark']
-
-        # username = get_object_or_404(User,username=request.user.username)
-        # idd = ExtraInfo.objects.get(user=username)
-        # student = Student.objects.get(id=idd.id)
-
-        feedback_request = get_object_or_404(Feedback,
-            student_id = student_id,
-            mess = mess,
-            feedback_type = feedback_type,
-            description = description,
-            fdate = fdate,
-        )
-        feedback_request.feedback_remark = new_remark
-        feedback_request.save()
-
-        return Response({'status':200})
-    
     def delete(self, request):
-        data = request.data
-        student_id = data.get('student_id')
-        mess = data.get('mess')
-        feedback_type = data.get('feedback_type')
-        description = data.get('description')
-        fdate = data.get('fdate')
-
-        # Locate the feedback record
-        feedback_request = get_object_or_404(
-            Feedback,
-            student_id=student_id,
-            mess=mess,
-            feedback_type=feedback_type,
-            description=description,
-            fdate=fdate,
-        )
-        
-        # Delete the feedback record
-        feedback_request.delete()
-        
-        return Response({'status': 200, 'message': 'Feedback deleted successfully.'})
+        try:
+            delete_feedback(request.data)
+            return Response({'status': 200, 'message': 'Feedback deleted successfully.'})
+        except Exception:
+            return Response({'error': 'Feedback not found.'}, status=404)
 
 
 class MessinfoApi(APIView):
+
     def get(self, request):
-        messinfo_obj = Messinfo.objects.all();
+        messinfo_obj = get_messinfo_queryset()
         serialized_obj = MessinfoSerializer(messinfo_obj, many=True)
-        return Response({'status':200, 'payload':serialized_obj.data})  
+        return Response({'status': 200, 'payload': serialized_obj.data})
 
     def post(self, request):
-        data = request.data
-        
-        mess_option = data['mess_option']
-        
-        username = get_object_or_404(User,username=request.user.username)
-        idd = ExtraInfo.objects.get(user=username)
-        student = Student.objects.get(id=idd.id)
-        obj = Messinfo(
-            student_id = student,
-            mess_option =mess_option,
-        )
-        obj.save()
-        return Response({'status':200})          
+        serializer = MessinfoSerializer(data=request.data)
+        if serializer.is_valid():
+            create_messinfo(serializer.validated_data, request_user=request.user)
+            return Response({'status': 200})
+        return Response(serializer.errors, status=400)
+
 
 class Mess_regApi(APIView):
+
     def get(self, request):
-        mess_reg_obj = Mess_reg.objects.all();
+        mess_reg_obj = get_mess_reg_queryset()
         serialized_obj = Mess_regSerializer(mess_reg_obj, many=True)
-        return Response({'status':200, 'payload':serialized_obj.data})    
+        return Response({'status': 200, 'payload': serialized_obj.data})
 
     def post(self, request):
-        data = request.data
-        
-        sem = data['sem']
-        start_reg = data['start_reg']
-        end_reg= data['end_reg']
-        
-        obj = Mess_reg(
-            sem = sem,
-            start_reg = start_reg,
-            end_reg = end_reg
-        )
-        obj.save()
-        return Response({'status':200})              
+        serializer = Mess_regSerializer(data=request.data)
+        if serializer.is_valid():
+            create_mess_reg(serializer.validated_data)
+            return Response({'status': 200})
+        return Response(serializer.errors, status=400)
+
 
 class MessBillBaseApi(APIView):
+
     def get(self, request):
-        messBillBase_obj = MessBillBase.objects.all();
+        messBillBase_obj = get_mess_bill_base_queryset()
         serialized_obj = MessBillBaseSerializer(messBillBase_obj, many=True)
-        return Response({'status':200, 'payload':serialized_obj.data})  
+        return Response({'status': 200, 'payload': serialized_obj.data})
 
     def post(self, request):
-        data = request.data
-        
-        bill_amount = data['bill_amount']
-        # timestamp = data['timestamp']
-        
-        obj = MessBillBase(
-            bill_amount = bill_amount,
-            # timestamp = timestamp,
-        )
-        obj.save()
-        return Response({'status':200})      
+        serializer = MessBillBaseSerializer(data=request.data)
+        if serializer.is_valid():
+            create_mess_bill_base(serializer.validated_data)
+            return Response({'status': 200})
+        return Response(serializer.errors, status=400)
+
 
 class Monthly_billApi(APIView):
+
     def get(self, request):
-        
-        monthly_bill_obj = Monthly_bill.objects.all();
+        monthly_bill_obj = get_monthly_bill_queryset()
         serialized_obj = Monthly_billSerializer(monthly_bill_obj, many=True)
-        return Response({'status':200, 'payload':serialized_obj.data})    
+        return Response({'status': 200, 'payload': serialized_obj.data})
 
     def post(self, request):
-        data = request.data
-        
-        student_id = data['student_id']
-        month = data['month']
-        year = data['year']
-        amount = data['amount']
-        rebate_count = data['rebate_count']
-        rebate_amount = data['rebate_amount']
-        total_bill = data['amount']-(data['rebate_count']*data['rebate_amount'])
-        paid = data['paid']
+        serializer = Monthly_billSerializer(data=request.data)
+        if serializer.is_valid():
+            create_monthly_bill(serializer.validated_data)
+            return Response({'status': 200})
+        return Response(serializer.errors, status=400)
 
-        username = get_object_or_404(User,username=student_id)
-        idd = ExtraInfo.objects.get(user=username)
-        student = Student.objects.get(id=idd.id)
-
-        try:
-            reg_main = Monthly_bill.objects.get(student_id=student, year = year, month = month)
-            reg_main.amount = amount
-            reg_main.rebate_count = rebate_count
-            reg_main.rebate_amount = rebate_amount
-            reg_main.total_bill = total_bill
-        except Monthly_bill.DoesNotExist:
-            reg_main = Monthly_bill.objects.create(
-                student_id=student,
-                month = month,
-                year = year,
-                amount = amount,
-                rebate_amount = rebate_amount,
-                rebate_count = rebate_count,
-                total_bill = total_bill,
-                paid = paid
-            )
-        reg_main.save()
-        return Response({'status':200})                       
 
 class PaymentsApi(APIView):
+
     def get(self, request):
-        username = get_object_or_404(User,username=request.user.username)
-        idd = ExtraInfo.objects.get(user=username)
-        student = Student.objects.get(id=idd.id)
-        payments_obj = Payments.objects.all();
-        payments_obj = payments_obj.filter(student_id=student)
+        student = get_student_from_request_user(request.user)
+        payments_obj = get_payments_queryset(student=student)
         serialized_obj = PaymentsSerializer(payments_obj, many=True)
-        return Response({'status':200, 'payload':serialized_obj.data})   
-
-    # def post(self, request):
-    #     data = request.data
-        
-    #     # sem = data['sem']
-    #     # year = data['year']
-    #     amount_paid = data['amount_paid']
+        return Response({'status': 200, 'payload': serialized_obj.data})
 
 
-    #     username = get_object_or_404(User,username=request.user.username)
-    #     idd = ExtraInfo.objects.get(user=username)
-    #     student = Student.objects.get(id=idd.id)
-
-        
-    #     obj = Payments(
-    #         student_id = student,
-    #         # sem = sem,
-    #         # year = year,
-    #         amount_paid = amount_paid,
-    #     )
-    #     obj.save()
-    #     return Response({'status':200}) 
-    
 class MenuApi(APIView):
+
     def get(self, request):
-        menu_obj = Menu.objects.all();
+        menu_obj = get_menu_queryset()
         serialized_obj = MenuSerializer(menu_obj, many=True)
-        return Response({'status':200, 'payload':serialized_obj.data})
+        return Response({'status': 200, 'payload': serialized_obj.data})
 
     def post(self, request):
-        data = request.data
-        print(data)
-        
-        mess_option = data['mess_option']
-        meal_time = data['meal_time']
-        dish = data['dish']
-
-        
-        obj = Menu(
-            mess_option = mess_option,
-            meal_time = meal_time,
-            dish = dish,
-        )
-        obj.save()
-        return Response({'status':200})     
-class RebateApi(APIView):
-    def get(self, request):
-        rebate_obj = Rebate.objects.all();
-        serialized_obj = RebateSerializer(rebate_obj, many=True)
-        return Response({'status':200, 'payload':serialized_obj.data}) 
-
-    def post(self, request):
-        data = request.data
-
-        # student_id = data['mess_option']
-        flag=1
-        start_date = data['start_date']
-        end_date = data['end_date']
-        purpose = data['purpose']
-        status = data['status']
-        """
-            status:
-                '2' -> approved
-                '1' -> pending
-                '0' -> declined
-        """
-        app_date = data['app_date']
-        leave_type = data['leave_type']
-
-        if (end_date < start_date):
-            flag = 0
-            return Response({'status': 3, 'message': 'Please check the dates'})
-
-        username = get_object_or_404(User,username=request.user.username)
-        idd = ExtraInfo.objects.get(user=username)
-        student = Student.objects.get(id=idd.id)
-
-        date_format = "%Y-%m-%d"
-        b = datetime.datetime.strptime(str(start_date), date_format)
-        d = datetime.datetime.strptime(str(end_date), date_format)
-
-        rebate_check = Rebate.objects.filter(student_id=student, status='2')
-        for r in rebate_check:
-            a = datetime.datetime.strptime(str(r.start_date), date_format)
-            c = datetime.datetime.strptime(str(r.end_date), date_format)
-            if ((b <= a and (d >= a and d <= c)) or (b >= a and (d >= a and d <= c))
-                    or (b <= a and (d >= c)) or ((b >= a and b <= c) and (d >= c))):
-                flag = 0
-                data = {
-                    'status': 3,
-                    'message': "Already applied for these dates",
-                }
-                return Response({'status': 3, 'message': 'Already applied for these dates'})
-        
-        obj = Rebate(
-            student_id = student,
-            leave_type = leave_type,
-            app_date = app_date,
-            status = status,
-            purpose = purpose,
-            end_date= end_date,
-            start_date = start_date
-        )
-
-        if flag == 1:
-            message = 'Your leave request has been accepted between dates ' + str(b.date()) + ' and ' + str(d.date())
-            # central_mess_notif(request.user, student.id.user, 'leave_request', message)
-        obj.save()
-        return Response({'status':200})     
+        serializer = MenuSerializer(data=request.data)
+        if serializer.is_valid():
+            create_menu(serializer.validated_data)
+            return Response({'status': 200})
+        return Response(serializer.errors, status=400)
 
     def put(self, request):
-        data = request.data
-
-        student_id = data['student_id']
-        start_date = data['start_date']
-        end_date = data['end_date']
-        purpose = data['purpose']
-        new_status = data['status']
-        app_date = data['app_date']
-        leave_type = data['leave_type']
-        rebate_remark = data['rebate_remark']
-
-        # username = get_object_or_404(User,username=student_id)
-        # idd = ExtraInfo.objects.get(user=username)
-        # student = Student.objects.get(id=idd.id)
-        
-        rebate_request = get_object_or_404(Rebate, student_id=student_id, end_date=end_date, start_date=start_date, app_date=app_date, purpose=purpose, leave_type=leave_type)
-
-        # Update the status
-        rebate_request.status = new_status
-        rebate_request.rebate_remark = rebate_remark
-        rebate_request.save()
-
+        mess_option = request.data.get('mess_option')
+        items = request.data.get('items', [])
+        if not mess_option or not items:
+            return Response({'error': 'mess_option and items are required'}, status=400)
+        update_menu_items(mess_option, items)
         return Response({'status': 200})
 
-class Vacation_foodApi(APIView):
+
+class RebateApi(APIView):
+
     def get(self, request):
-        vacation_food_obj = Vacation_food.objects.all();
-        serialized_obj = Vacation_foodSerializer(vacation_food_obj, many=True)
-        return Response({'status':200, 'payload':serialized_obj.data}) 
+        rebate_obj = get_rebate_queryset()
+        serialized_obj = RebateSerializer(rebate_obj, many=True)
+        return Response({'status': 200, 'payload': serialized_obj.data})
 
     def post(self, request):
-        data = request.data
-        
-        start_date = data['start_date']
-        end_date = data['end_date']
-        purpose = data['purpose']
-        status = data['status']
-        app_date = data['app_date']
-
-
-        username = get_object_or_404(User,username=request.user.username)
-        idd = ExtraInfo.objects.get(user=username)
-        student = Student.objects.get(id=idd.id)
-
-        
-        obj = Vacation_food(
-            student_id = student,
-            app_date = app_date,
-            status = status,
-            purpose = purpose,
-            end_date= end_date,
-            start_date = start_date
-        )
-        obj.save()
-        return Response({'status':200})   
+        serializer = RebateSerializer(data=request.data)
+        if serializer.is_valid():
+            try:
+                create_rebate(serializer.validated_data, request_user=request.user)
+            except RebateOverlapError as exc:
+                return Response(exc.payload or {'message': exc.message})
+            return Response({'status': 200})
+        return Response(serializer.errors, status=400)
 
     def put(self, request):
-        print(request.data)
-        data = request.data
-        
-        student_id = data['student_id']
-        start_date = data['start_date']
-        end_date = data['end_date']
-        purpose = data['purpose']
-        new_status = data['status']
-        app_date = data['app_date']
+        serializer = RebateStatusUpdateSerializer(data=request.data)
+        if serializer.is_valid():
+            update_rebate_status(serializer.validated_data)
+            return Response({'status': 200})
+        return Response(serializer.errors, status=400)
 
 
-        # username = get_object_or_404(User,username=request.user.username)
-        # idd = ExtraInfo.objects.get(user=username)
-        # student = Student.objects.get(id=idd.id)
+class Vacation_foodApi(APIView):
 
-        try:
-            vacation_food_request = get_object_or_404(Vacation_food,
-                student_id = student_id,
-                app_date = app_date,
-                purpose = purpose,
-                end_date= end_date,
-                start_date = start_date
-            )
-            vacation_food_request.status = new_status
-            vacation_food_request.save()
-            return Response({'status':200})      
-        except:
-            vacation_food_request = Vacation_food.objects.filter(student_id = student_id,
-                app_date = app_date,
-                purpose = purpose,
-                end_date= end_date,
-                start_date = start_date
-            ).latest('app_date')
-            vacation_food_request.status = new_status
-            vacation_food_request.save()
-            return Response({'status':200})      
-
-class Nonveg_menuApi(APIView):
     def get(self, request):
-        nonveg_menu_obj = Nonveg_menu.objects.all();
-        serialized_obj = Nonveg_menuSerializer(nonveg_menu_obj, many=True)
-        return Response({'status':200, 'payload':serialized_obj.data})   
+        vacation_food_obj = get_vacation_food_queryset()
+        serialized_obj = Vacation_foodSerializer(vacation_food_obj, many=True)
+        return Response({'status': 200, 'payload': serialized_obj.data})
 
     def post(self, request):
-        data = request.data
-        
-        dish= data['dish']
-        price = data['price']
-        order_interval = data['order_interval']
+        serializer = Vacation_foodSerializer(data=request.data)
+        if serializer.is_valid():
+            create_vacation_food(serializer.validated_data, request_user=request.user)
+            return Response({'status': 200})
+        return Response(serializer.errors, status=400)
 
-        
-        obj = Nonveg_menu(
-            dish = dish,
-            price = price,
-            order_interval = order_interval,
-        )
-        obj.save()
-        return Response({'status':200})     
+    def put(self, request):
+        serializer = VacationFoodStatusUpdateSerializer(data=request.data)
+        if serializer.is_valid():
+            try:
+                update_vacation_food_status(serializer.validated_data)
+            except CentralMessServiceError as exc:
+                return Response({'error': exc.message}, status=exc.status_code)
+            return Response({'status': 200})
+        return Response(serializer.errors, status=400)
 
-class Nonveg_dataApi(APIView):
-    def get(self, request):
-        nonveg_data_obj = Nonveg_data.objects.all();
-        serialized_obj = Nonveg_dataSerializer(nonveg_data_obj, many=True)
-        return Response({'status':200, 'payload':serialized_obj.data})   
-
-    def post(self, request):
-        data = request.data
-        
-        dish= data['dish']
-        order_date = data['order_date']
-        app_date = data['app_date']
-        order_interval = data['order_interval']
-
-        username = get_object_or_404(User,username=request.user.username)
-        idd = ExtraInfo.objects.get(user=username)
-        student = Student.objects.get(id=idd.id)
-
-        dish_obj = Nonveg_menu.objects.get(dish=dish)
-        
-        obj = Nonveg_data(
-            student_id = student,
-            order_date = order_date,
-            app_date = app_date,
-            dish = dish_obj,
-            order_interval = order_interval,
-        )
-        obj.save()
-        return Response({'status':200})        
 
 class Special_requestApi(APIView):
+
     def get(self, request):
-        special_request_obj = Special_request.objects.all();
+        special_request_obj = get_special_request_queryset()
         serialized_obj = Special_requestSerializer(special_request_obj, many=True)
-        return Response({'status':200, 'payload':serialized_obj.data})  
+        return Response({'status': 200, 'payload': serialized_obj.data})
 
-        
     def post(self, request):
-        data = request.data
-
-        start_date = data['start_date']
-        end_date = data['end_date']
-        status = data['status']
-        app_date = data['app_date']
-        request_= data['request']
-        item1 = data['item1']
-        item2 = data['item2']
-
-
-
-        username = get_object_or_404(User,username=request.user.username)
-        idd = ExtraInfo.objects.get(user=username)
-        student = Student.objects.get(id=idd.id)
-        
-        obj = Special_request(
-            student_id = student,
-            app_date = app_date,
-            status = status,
-            item1 = item1,
-            item2 = item2,
-            end_date= end_date,
-            start_date = start_date,
-            request = request_
-        )
-        obj.save()
-        return Response({'status':200})    
+        serializer = Special_requestSerializer(data=request.data)
+        if serializer.is_valid():
+            create_special_request(serializer.validated_data, request_user=request.user)
+            return Response({'status': 200})
+        return Response(serializer.errors, status=400)
 
     def put(self, request):
-        print(request.data)
-        data = request.data
-        student_id = data['student_id']
-        start_date = data['start_date']
-        end_date = data['end_date']
-        app_date = data['app_date']
-        request_= data['request']
-        item1 = data['item1']
-        item2 = data['item2']
-        new_status = data['status']
+        serializer = SpecialRequestStatusUpdateSerializer(data=request.data)
+        if serializer.is_valid():
+            update_special_request_status(serializer.validated_data)
+            return Response({'status': 200})
+        return Response(serializer.errors, status=400)
 
-        # Fetch the Special_request object you want to update
-        # username = get_object_or_404(User, username=request.user.username)
-        # idd = ExtraInfo.objects.get(user=username)
-        # student = Student.objects.get(id=idd.id)
-
-        special_request = get_object_or_404(Special_request, student_id=student_id, app_date=app_date, item1=item1, item2=item2, end_date=end_date, start_date=start_date, request=request_)
-
-        # Update the status
-        special_request.status = new_status
-        special_request.save()
-
-        return Response({'status': 200})    
 
 class Mess_meetingApi(APIView):
+
     def get(self, request):
-        mess_meeting_obj = Mess_meeting.objects.all();
+        mess_meeting_obj = get_mess_meeting_queryset()
         serialized_obj = Mess_meetingSerializer(mess_meeting_obj, many=True)
-        return Response({'status':200, 'payload':serialized_obj.data})    
+        return Response({'status': 200, 'payload': serialized_obj.data})
 
     def post(self, request):
-        data = request.data
-        meet_date = data['meet_date']
-        agenda  = data['agenda']
-        venue = data['venue']
-        meeting_time = data['meeting_time']
+        serializer = Mess_meetingSerializer(data=request.data)
+        if serializer.is_valid():
+            create_mess_meeting(serializer.validated_data)
+            return Response({'status': 200})
+        return Response(serializer.errors, status=400)
 
-        obj = Mess_meeting(
-            meet_date = meet_date,
-            meeting_time = meeting_time,
-            agenda = agenda,
-            venue = venue,
-        )
-        obj.save()
-        return Response({'status':200})      
 
 class Mess_minutesApi(APIView):
+
     def get(self, request):
-        mess_minutes_obj = Mess_minutes.objects.all();
+        mess_minutes_obj = get_mess_minutes_queryset()
         serialized_obj = Mess_minutesSerializer(mess_minutes_obj, many=True)
-        return Response({'status':200, 'payload':serialized_obj.data})    
+        return Response({'status': 200, 'payload': serialized_obj.data})
 
     def post(self, request):
-        data = request.data
+        serializer = Mess_minutesSerializer(data=request.data)
+        if serializer.is_valid():
+            create_mess_minutes(serializer.validated_data)
+            return Response({'status': 200})
+        return Response(serializer.errors, status=400)
 
-        # meeting_date  = data['meeting_date']
-        mess_minutes  = data['mess_minutes']
-        meeting_date_obj = Mess_meeting.objects.get(meet_date=meeting_date)
 
-        obj = Mess_minutes(
-            # meeting_date = meeting_date_obj,
-            mess_minutes = mess_minutes,
-        )
-        obj.save()
-        return Response({'status':200})   
-  
 class Menu_change_requestApi(APIView):
+
     def get(self, request):
-        menu_change_request_obj = Menu_change_request.objects.all();
+        menu_change_request_obj = get_menu_change_request_queryset()
         serialized_obj = Menu_change_requestSerializer(menu_change_request_obj, many=True)
-        return Response({'status':200, 'payload':serialized_obj.data})   
+        return Response({'status': 200, 'payload': serialized_obj.data})
 
     def post(self, request):
-        data = request.data
-        dish = data['dish']
-        reason = data['reason']
-        status = data['status']
-        app_date = data['app_date']
-        request_ = data['request']
+        try:
+            create_menu_change_request(request.data, request_user=request.user)
+            return Response({'status': 200})
+        except Exception as exc:
+            return Response({'error': str(exc)}, status=400)
 
 
-        dish_obj = Menu.objects.get(dish=dish)
-        username = get_object_or_404(User,username=request.user.username)
-        idd = ExtraInfo.objects.get(user=username)
-        student = Student.objects.get(id=idd.id)
-        
-        obj = Menu_change_request(
-            student_id = student,
-            app_date = app_date,
-            status = status,
-            reason = reason,
-            request = request_,
-            dish = dish_obj
-        )
-        obj.save()
-        return Response({'status':200})      
+class Get_Filtered_Students(APIView):
 
-class Get_Filtered_Students(APIView): 
+    def post(self, request):
+        req_type = request.data.get('type')
 
-    def post(self,request):
-        type = request.data['type']
-        if(type=='filter'):
-            reg_main = Reg_main.objects.select_related('student_id','student_id__id','student_id__id__user','student_id__id__department').all()
-            status=request.data['status']
-            program=request.data['program']
-            mess_option=request.data['mess_option']
+        if req_type == 'filter':
+            reg_main = get_reg_main_queryset(
+                status=request.data.get('status'),
+                program=request.data.get('program'),
+                mess_option=request.data.get('mess_option'),
+            )
+            serialized_obj = GetFilteredSerialzer(reg_main, many=True)
+            return Response({'payload': serialized_obj.data})
 
-            if(status!='all'):
-
-                reg_main=reg_main.filter(current_mess_status=status)
-
-            if(program!='all'):
-                reg_main=reg_main.filter(program=program)
-
-            if(mess_option!='all'):
-
-                reg_main=reg_main.filter(mess_option=mess_option)        
-
-            serialized_obj = GetFilteredSerialzer(reg_main,many=True)
-            return Response({'payload':serialized_obj.data})
-
-        elif(type=='search'):
-            student = request.data['student_id']
-            student = str(student).upper()
+        elif req_type == 'search':
+            student_id = str(request.data.get('student_id', '')).upper()
             try:
-                reg_main = Reg_main.objects.select_related('student_id','student_id__id','student_id__id__user','student_id__id__department').get(student_id=student)
+                reg_main = get_reg_main_by_student_id(student_id)
                 serialized_obj = GetFilteredSerialzer(reg_main)
-                return Response({'payload':serialized_obj.data})
-            except:
-                response = JsonResponse({"error": "student does not exist"})
-                response.status_code = 404 
-                return response
+                return Response({'payload': serialized_obj.data})
+            except Exception:
+                return Response({'error': 'student does not exist'}, status=404)
+
+        return Response({'error': 'invalid type'}, status=400)
+
 
 class Get_Reg_Records(APIView):
-    def get(self,request):
+
+    def get(self, request):
         student_id = request.GET.get('student_id')
-        reg_record = Reg_records.objects.filter(student_id=student_id)
-        serialized_obj = reg_recordSerialzer(reg_record,many=True)
-        return Response({'payload':serialized_obj.data})
+        reg_record = get_reg_records_queryset(student=student_id)
+        serialized_obj = reg_recordSerialzer(reg_record, many=True)
+        return Response({'payload': serialized_obj.data})
 
 
 class Get_Student_bill(APIView):
 
-    def post(self,request):
-        student = request.data['student_id'] 
-        bill_details = Monthly_bill.objects.filter(student_id=student)
-
-        serialized_obj = Monthly_billSerializer(bill_details,many=True)
-        return Response({'payload':serialized_obj.data}) 
+    def post(self, request):
+        student = request.data.get('student_id')
+        bill_details = get_monthly_bill_queryset(student=student)
+        serialized_obj = Monthly_billSerializer(bill_details, many=True)
+        return Response({'payload': serialized_obj.data})
 
 
 class Get_Student_Payments(APIView):
 
-    def post(self,request):
-        student = request.data['student_id'] 
-        payment_details = Payments.objects.filter(student_id=student)
+    def post(self, request):
+        student = request.data.get('student_id')
+        payment_details = get_payments_queryset(student=student)
+        serialized_obj = PaymentsSerializer(payment_details, many=True)
+        return Response({'payload': serialized_obj.data})
 
-        serialized_obj = PaymentsSerializer(payment_details,many=True)
-        return Response({'payload':serialized_obj.data}) 
-    
+
 class Get_Student_Details(APIView):
 
-    def post(self,request):
-        student = request.data['student_id'] 
-        bill_details = Monthly_bill.objects.filter(student_id=student)
-        payment_details = Payments.objects.filter(student_id=student)
-        reg_record = Reg_records.objects.filter(student_id=student)
-        payment_serialized_obj = PaymentsSerializer(payment_details,many=True)
-        bill_serialized_obj = Monthly_billSerializer(bill_details,many=True)
-        reg_record_serialized_obj = reg_recordSerialzer(reg_record,many=True)
-        reg_main = Reg_main.objects.select_related('student_id','student_id__id','student_id__id__user','student_id__id__department').get(student_id=student)
-        serialized_obj = GetFilteredSerialzer(reg_main)
-        data={'payment':payment_serialized_obj.data,'bill':bill_serialized_obj.data,'reg_records':reg_record_serialized_obj.data,'student_details':serialized_obj.data}
-        return Response({'payload':data}) 
-    
+    def post(self, request):
+        student = request.data.get('student_id')
+        try:
+            reg_main = get_reg_main_by_student_id(student)
+        except Exception:
+            return Response({'error': 'student does not exist'}, status=404)
+
+        data = {
+            'payment': PaymentsSerializer(
+                get_payments_queryset(student=student), many=True
+            ).data,
+            'bill': Monthly_billSerializer(
+                get_monthly_bill_queryset(student=student), many=True
+            ).data,
+            'reg_records': reg_recordSerialzer(
+                get_reg_records_queryset(student=student), many=True
+            ).data,
+            'student_details': GetFilteredSerialzer(reg_main).data,
+        }
+        return Response({'payload': data})
+
+
 class RegistrationRequestApi(APIView):
+
     def get(self, request):
-        registration_requests = Registration_Request.objects.all()
+        registration_requests = get_registration_request_queryset()
         serializer = RegistrationRequestSerializer(registration_requests, many=True)
         return Response({'status': 200, 'payload': serializer.data})
 
     def post(self, request):
         serializer = RegistrationRequestSerializer(data=request.data)
         if serializer.is_valid():
-            serializer.save()
+            try:
+                create_registration_request(
+                    serializer.validated_data, request_user=request.user
+                )
+                return Response({'status': 200})
+            except CentralMessServiceError as exc:
+                return Response({'error': str(exc)}, status=exc.status_code)
+            except Exception as exc:
+                return Response({'error': str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+        return Response(serializer.errors, status=400)
+
+    def put(self, request):
+        serializer = RegistrationDecisionSerializer(data=request.data)
+        if serializer.is_valid():
+            decide_registration_request(serializer.validated_data)
             return Response({'status': 200})
         return Response(serializer.errors, status=400)
-    
-    def put(self, request):
-        try:
-            data = request.data
-            print(data)
-            student_id = data['student_id']
-            start_date = data['start_date']
-            payment_date = data['payment_date']
-            amount = data['amount']
-            Txn_no = data['Txn_no']
-            img = data['img']
-            new_status = data['status']
-            new_remark = data['registration_remark']
-            mess_option = data['mess_option']
-
-            username = get_object_or_404(User, username=student_id)
-            idd = ExtraInfo.objects.get(user=username)
-            student = Student.objects.get(id=idd.id)
-
-            registration_request = get_object_or_404(Registration_Request, student_id = student_id,  start_date = start_date, payment_date = payment_date, amount = amount, Txn_no = Txn_no)
-            
-            registration_request.status = new_status
-            registration_request.registration_remark = new_remark
-            registration_request.save()
-
-            if (new_status == 'accept'):
-                new_payment_record = Payments(student_id = student, amount_paid = amount, payment_date=payment_date, payment_month=current_month(), payment_year=current_year())
-                new_payment_record.save()
-
-                try:
-                    reg_main = Reg_main.objects.get(student_id=student)
-                    reg_main.current_mess_status = "Registered"
-                    reg_main.balance = F('balance') + amount
-                    reg_main.mess_option = mess_option
-                except Reg_main.DoesNotExist:
-                    reg_main = Reg_main.objects.create(
-                        student_id=student,
-                        program=student.programme,
-                        current_mess_status="Registered",
-                        balance=amount,
-                        mess_option=mess_option
-                    )
-                reg_main.save()
-
-                new_reg_record = Reg_records(student_id=student, start_date=start_date, end_date=None)
-                new_reg_record.save()
 
 
-            return Response({'status': 200})
-        except Exception as e:
-            print({'error': str(e)})
-            return Response({'error': str(e)}, status=400)
-    
 class DeregistrationRequestApi(APIView):
+
     def get(self, request):
-        deregistration_requests = Deregistration_Request.objects.all()
+        deregistration_requests = get_deregistration_request_queryset()
         serializer = DeregistrationRequestSerializer(deregistration_requests, many=True)
         return Response({'status': 200, 'payload': serializer.data})
 
     def post(self, request):
         serializer = DeregistrationRequestSerializer(data=request.data)
         if serializer.is_valid():
-            serializer.save()
-            return Response({'status': 200})
+            try:
+                create_deregistration_request(
+                    serializer.validated_data, request_user=request.user
+                )
+                return Response({'status': 200})
+            except CentralMessServiceError as exc:
+                return Response({'error': str(exc)}, status=exc.status_code)
+            except Exception as exc:
+                return Response({'error': str(exc)}, status=status.HTTP_400_BAD_REQUEST)
         return Response(serializer.errors, status=400)
-    
+
     def put(self, request):
-        try:
-            data = request.data
-            print(data)
-            student_id = data['student_id']
-            end_date = data['end_date']
-            new_status = data['status']
-            new_remark = data['deregistration_remark']
+        serializer = DeregistrationDecisionSerializer(data=request.data)
+        if serializer.is_valid():
+            try:
+                decide_deregistration_request(serializer.validated_data)
+                return Response({'status': 200})
+            except CentralMessServiceError as exc:
+                return Response({'error': str(exc)}, status=exc.status_code)
+            except Exception as exc:
+                return Response({'error': str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+        return Response(serializer.errors, status=400)
 
-            username = get_object_or_404(User, username=student_id)
-            idd = ExtraInfo.objects.get(user=username)
-            student = Student.objects.get(id=idd.id)
+    def delete(self, request):
+        serializer = DeregistrationDeleteSerializer(data=request.data)
+        if serializer.is_valid():
+            try:
+                delete_deregistration_request(
+                    serializer.validated_data,
+                    request_user=request.user,
+                )
+                return Response({'status': 200, 'message': 'Deregistration request deleted.'})
+            except CentralMessServiceError as exc:
+                return Response({'error': str(exc)}, status=exc.status_code)
+            except Exception as exc:
+                return Response({'error': str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+        return Response(serializer.errors, status=400)
 
-            deregistration_request = get_object_or_404(Deregistration_Request, student_id = student_id,  end_date = end_date)
-            
-            deregistration_request.status = new_status
-            deregistration_request.deregistration_remark = new_remark
-            deregistration_request.save()
-
-            if (new_status == 'accept'):
-
-                reg_main = Reg_main.objects.get(student_id=student)
-                reg_main.current_mess_status = "Deregistered"
-                reg_main.save()
-
-                reg_record = Reg_records.objects.filter(student_id=student).latest('start_date')
-                reg_record.end_date = end_date
-                reg_record.save()
-            return Response({'status': 200})
-        except Exception as e:
-            print({'error': str(e)})
-            return Response({'error': str(e)}, status=400)
-
-# class DeregistrationApi(APIView):
-#     def post(self, request):
-#         try:
-#             data = request.data
-#             print(data)
-#             student_id = data['student_id']
-#             end_date = data['end_date']
-
-#             username = get_object_or_404(User, username=student_id)
-#             idd = ExtraInfo.objects.get(user=username)
-#             student = Student.objects.get(id=idd.id)
-
-#             reg_main = Reg_main.objects.get(student_id=student)
-#             reg_main.current_mess_status = "Deregistered"
-#             reg_main.save()
-
-#             reg_record = Reg_records.objects.filter(student_id=student).latest('start_date')
-#             reg_record.end_date = end_date
-#             reg_record.save()
-#             return Response({'status': 200})
-#         except Exception as e:
-#             print({'error': str(e)})
-#             return Response({'error': str(e)}, status=400)
 
 class UpdatePaymentRequestApi(APIView):
+
     def get(self, request):
         student_id = request.query_params.get('student_id')
-        if student_id:
-            update_payment_requests = Update_Payment.objects.filter(student_id=student_id)
-        else:
-            update_payment_requests = Update_Payment.objects.all()
-
+        update_payment_requests = get_update_payment_request_queryset(student=student_id)
         serializer = UpdatePaymentRequestSerializer(update_payment_requests, many=True)
         return Response({'status': 200, 'payload': serializer.data})
 
     def post(self, request):
         serializer = UpdatePaymentRequestSerializer(data=request.data)
         if serializer.is_valid():
-            serializer.save()
+            create_update_payment_request(
+                serializer.validated_data, request_user=request.user
+            )
             return Response({'status': 200})
         return Response(serializer.errors, status=400)
-    
+
     def put(self, request):
-        try:
-            data = request.data
-            print(data)
-            student_id = data['student_id']
-            payment_date = data['payment_date']
-            amount = data['amount']
-            Txn_no = data['Txn_no']
-            img = data['img']
-            new_status = data['status']
-            new_remark = data['update_payment_remark']
-
-            username = get_object_or_404(User, username=student_id)
-            idd = ExtraInfo.objects.get(user=username)
-            student = Student.objects.get(id=idd.id)
-
-            UpdatePayment_request = get_object_or_404(Update_Payment, student_id = student_id, payment_date = payment_date, amount = amount, Txn_no = Txn_no)
-            
-            UpdatePayment_request.status = new_status
-            UpdatePayment_request.update_payment_remark = new_remark
-            UpdatePayment_request.save()
-
-            if (new_status == 'accept'):
-                new_payment_record = Payments(student_id = student, amount_paid = amount, payment_date=payment_date, payment_month=current_month(), payment_year=current_year())
-                new_payment_record.save()
-
-                reg_main = Reg_main.objects.get(student_id=student)
-                reg_main.balance = F('balance') + amount
-                reg_main.save()
-
+        serializer = UpdatePaymentDecisionSerializer(data=request.data)
+        if serializer.is_valid():
+            decide_update_payment_request(serializer.validated_data)
             return Response({'status': 200})
-        except Exception as e:
-            print({'error': str(e)})
-            return Response({'error': str(e)}, status=400)
+        return Response(serializer.errors, status=400)
 
-from rest_framework.parsers import MultiPartParser, FormParser
-from rest_framework import status
-from openpyxl import load_workbook
 
 class UpdateBillExcelAPI(APIView):
     parser_classes = (MultiPartParser, FormParser)
 
     def post(self, request):
         if 'file' not in request.FILES:
-            return Response({'error': 'No file provided'}, status=status.HTTP_400_BAD_REQUEST)
-
+            return Response(
+                {'error': 'No file provided'}, status=status.HTTP_400_BAD_REQUEST
+            )
         file = request.FILES['file']
         if not file.name.endswith(('.xlsx', '.xls')):
-            return Response({'error': 'Invalid file format. Only .xlsx and .xls are allowed.'}, status=status.HTTP_400_BAD_REQUEST)
-
+            return Response(
+                {'error': 'Invalid file format. Only .xlsx and .xls are allowed.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
         try:
-            wb = load_workbook(file)
-            sheet = wb.active
-            flag = False
+            process_excel_bill_update(file)
+            return Response(
+                {'message': 'File processed successfully'}, status=status.HTTP_200_OK
+            )
+        except Exception as exc:
+            return Response(
+                {'error': f'An error occurred: {str(exc)}'},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            )
 
-            for row in sheet.iter_rows(min_row=2):
-                student_id = str(row[0].value).upper()
-                try:
-                    student = Student.objects.select_related('id', 'id__user', 'id__department').get(id=student_id)
-                except Student.DoesNotExist:
-                    continue
 
-                month = str(row[1].value)
-                year = row[2].value
-                amt = row[3].value
-                rebate_cnt = row[4].value
-                rebate_amt = row[5].value
-                total_amt = row[6].value
-                try:
-                    bill = Monthly_bill.objects.get(student_id=student_id, month=month, year=year)
-                    reg_main = Reg_main.objects.get(student_id=student_id)
-                    reg_main.balance += bill.total_bill
-                    bill.amount = amt
-                    bill.rebate_count = rebate_cnt
-                    bill.rebate_amount = rebate_amt
-                    bill.total_bill = total_amt
-                    reg_main.balance -= total_amt
-                    
-                    bill.save()
-                    reg_main.save()
-                except Monthly_bill.DoesNotExist:
-                    bill = Monthly_bill(
-                        student_id=student,
-                        month=month,
-                        year=year,
-                        amount=amt,
-                        rebate_count=rebate_cnt,
-                        rebate_amount=rebate_amt,
-                        total_bill=total_amt
-                    )
-                    bill.save()
-
-            return Response({'message': 'File processed successfully'}, status=status.HTTP_200_OK)
-
-        except Exception as e:
-            return Response({'error': f'An error occurred: {str(e)}'}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
-        
 class Get_Mess_Balance_Status(APIView):
-    def get(self, request):
-        username = get_object_or_404(User,username=request.user.username)
-        idd = ExtraInfo.objects.get(user=username)
-        student_id = Student.objects.get(id=idd.id)
-        try:
-            mess_optn = Reg_main.objects.select_related('student_id','student_id__id','student_id__id__user','student_id__id__department').get(student_id=student_id)
-            # y = Menu.objects.filter(mess_option=mess_optn.mess_option)
-            current_rem_balance = mess_optn.balance
-            current_mess_status = mess_optn.current_mess_status
-        except:
-            mess_optn={}
-            mess_optn={'mess_option':'no-mess'}
-            # y = Menu.objects.filter(mess_option="mess1")
-            current_rem_balance = 0
-            current_mess_status = 'Deregistered'
 
-        return Response({'payload': {'mess_option': mess_optn.mess_option, 'current_rem_balance': current_rem_balance, 'current_mess_status': current_mess_status}})
+    def get(self, request):
+        student = get_student_from_request_user(request.user)
+        mess_optn = get_reg_main_for_student(student)
+
+        if mess_optn:
+            payload = {
+                'mess_option': mess_optn.mess_option,
+                'current_rem_balance': mess_optn.balance,
+                'current_mess_status': mess_optn.current_mess_status,
+            }
+        else:
+            payload = {
+                'mess_option': 'no-mess',
+                'current_rem_balance': 0,
+                'current_mess_status': 'Deregistered',
+            }
+
+        return Response({'payload': payload})
+
+
+class MenuPollApi(APIView):
+    """
+    GET  ?mess_option=&active_only=true  — list polls
+    POST {question, option1, option2, option3?, option4?, mess_option, end_date?}  — create poll (caretaker)
+    PUT  {poll_id, action:"vote", selected_option}  — cast/change vote (student)
+    PUT  {poll_id, action:"close"}  — close poll (caretaker)
+    DELETE {poll_id}  — delete poll (caretaker)
+    """
+
+    def get(self, request):
+        mess_option = request.query_params.get("mess_option")
+        active_only = request.query_params.get("active_only", "").lower() == "true"
+        polls = get_poll_queryset(mess_option=mess_option, active_only=active_only)
+        serializer = MenuPollSerializer(polls, many=True, context={"request": request})
+        return Response({"status": 200, "payload": serializer.data})
+
+    def post(self, request):
+        serializer = MenuPollSerializer(data=request.data, context={"request": request})
+        if serializer.is_valid():
+            try:
+                poll = create_menu_poll(serializer.validated_data, request_user=request.user)
+                return Response(
+                    {"status": 200, "payload": MenuPollSerializer(poll, context={"request": request}).data},
+                    status=status.HTTP_201_CREATED,
+                )
+            except CentralMessServiceError as exc:
+                return Response({"error": str(exc)}, status=exc.status_code)
+        return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+    def put(self, request):
+        poll_id = request.data.get("poll_id")
+        action = request.data.get("action")
+        if not poll_id:
+            return Response({"error": "poll_id is required."}, status=400)
+
+        if action == "vote":
+            selected_option = request.data.get("selected_option")
+            if not selected_option:
+                return Response({"error": "selected_option is required."}, status=400)
+            try:
+                submit_poll_vote(poll_id, int(selected_option), request_user=request.user)
+                return Response({"status": 200, "message": "Vote recorded."})
+            except CentralMessServiceError as exc:
+                return Response({"error": str(exc)}, status=exc.status_code)
+        elif action == "close":
+            try:
+                close_menu_poll(poll_id, request_user=request.user)
+                return Response({"status": 200, "message": "Poll closed."})
+            except Exception as exc:
+                return Response({"error": str(exc)}, status=400)
+
+        return Response({"error": "action must be vote or close."}, status=400)
+
+    def delete(self, request):
+        poll_id = request.data.get("poll_id")
+        if not poll_id:
+            return Response({"error": "poll_id is required."}, status=400)
+        from django.shortcuts import get_object_or_404
+        from applications.central_mess.models import MenuPoll
+        poll = get_object_or_404(MenuPoll, pk=poll_id)
+        poll.delete()
+        return Response({"status": 200})
+
+
+class AdminMessManagementApi(APIView):
+    """
+    Admin-level direct student registration management for caretaker/mess_manager.
+    POST  {action:"add", student_id, mess_option, amount, program}
+    POST  {action:"remove", student_id}
+    POST  {action:"remove_all", mess_option}
+    """
+
+    def post(self, request):
+        action = request.data.get("action")
+        student_id = request.data.get("student_id", "").strip()
+
+        if action == "add":
+            mess_option = request.data.get("mess_option", "mess1")
+            amount = int(request.data.get("amount", 0))
+            program = request.data.get("program", "UG")
+            try:
+                admin_register_student(
+                    student_id, mess_option, amount, program, request.user
+                )
+                return Response({"status": 200, "message": f"Student {student_id} registered to {mess_option}."})
+            except CentralMessServiceError as exc:
+                return Response({"error": str(exc)}, status=exc.status_code)
+
+        elif action == "remove":
+            try:
+                admin_deregister_student(student_id, request.user)
+                return Response({"status": 200, "message": f"Student {student_id} deregistered."})
+            except CentralMessServiceError as exc:
+                return Response({"error": str(exc)}, status=exc.status_code)
+
+        elif action == "remove_all":
+            mess_option = request.data.get("mess_option")
+            if not mess_option:
+                return Response({"error": "mess_option is required."}, status=400)
+            count = admin_deregister_all_from_mess(mess_option, request.user)
+            return Response({"status": 200, "message": f"Deregistered {count} students from {mess_option}."})
+
+        return Response({"error": "Invalid action. Must be add, remove, or remove_all."}, status=400)
+
+
+class AnnouncementApi(APIView):
+
+    def get(self, request):
+        mess_option = request.query_params.get("mess_option")
+        announcements = get_announcement_queryset(mess_option=mess_option)
+        serializer = AnnouncementSerializer(announcements, many=True)
+        return Response({'status': 200, 'payload': serializer.data})
+
+    def post(self, request):
+        serializer = AnnouncementSerializer(data=request.data)
+        if serializer.is_valid():
+            try:
+                announcement = create_announcement(
+                    serializer.validated_data, request_user=request.user
+                )
+                return Response(
+                    {'status': 200, 'payload': AnnouncementSerializer(announcement).data},
+                    status=status.HTTP_201_CREATED,
+                )
+            except CentralMessServiceError as exc:
+                return Response({'error': str(exc)}, status=exc.status_code)
+        return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+    def delete(self, request):
+        announcement_id = request.data.get("id")
+        if not announcement_id:
+            return Response({'error': 'id is required.'}, status=status.HTTP_400_BAD_REQUEST)
+        try:
+            delete_announcement(announcement_id, request_user=request.user)
+            return Response({'status': 200})
+        except Exception as exc:
+            return Response({'error': str(exc)}, status=status.HTTP_404_NOT_FOUND)
+
+
+class VacationSurveyApi(APIView):
+    """
+    GET  ?mess_option=&active_only=  — list surveys
+    POST {title, description?, vacation_start, vacation_end, mess_option}  — create survey (caretaker)
+    PUT  {survey_id, response, remarks?}  — respond to survey (student)
+    DELETE {survey_id}  — delete survey (caretaker)
+    """
+
+    def get(self, request):
+        mess_option = request.query_params.get("mess_option")
+        active_only = request.query_params.get("active_only", "").lower() == "true"
+        surveys = get_vacation_survey_queryset(mess_option=mess_option, active_only=active_only)
+        serializer = VacationSurveySerializer(surveys, many=True, context={"request": request})
+        return Response({"status": 200, "payload": serializer.data})
+
+    def post(self, request):
+        serializer = VacationSurveySerializer(data=request.data, context={"request": request})
+        if serializer.is_valid():
+            try:
+                survey = create_vacation_survey(serializer.validated_data, request_user=request.user)
+                return Response(
+                    {"status": 200, "payload": VacationSurveySerializer(survey, context={"request": request}).data},
+                    status=status.HTTP_201_CREATED,
+                )
+            except CentralMessServiceError as exc:
+                return Response({"error": str(exc)}, status=exc.status_code)
+        return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+    def put(self, request):
+        survey_id = request.data.get("survey_id")
+        response_val = request.data.get("response")
+        remarks = request.data.get("remarks", "")
+        if not survey_id or not response_val:
+            return Response({"error": "survey_id and response are required."}, status=400)
+        try:
+            submit_survey_response(survey_id, response_val, remarks, request_user=request.user)
+            return Response({"status": 200, "message": "Response recorded."})
+        except CentralMessServiceError as exc:
+            return Response({"error": str(exc)}, status=exc.status_code)
+
+    def delete(self, request):
+        survey_id = request.data.get("survey_id")
+        if not survey_id:
+            return Response({"error": "survey_id is required."}, status=400)
+        from django.shortcuts import get_object_or_404
+        from applications.central_mess.models import VacationSurvey
+        survey = get_object_or_404(VacationSurvey, pk=survey_id)
+        survey.delete()
+        return Response({"status": 200})

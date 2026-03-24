@@ -12,33 +12,28 @@ class Migration(migrations.Migration):
     ]
 
     operations = [
-        # Add database indexes for optimized query performance
+        # Add database indexes for optimized query performance.
+        # Guard this for fresh databases where course_registration may not exist yet.
         migrations.RunSQL(
-            sql=[
-                # Main composite index for course registration queries
-                """
-                CREATE INDEX IF NOT EXISTS idx_course_reg_main_query 
-                ON course_registration(session, semester_type, course_id_id, registration_type, student_id_id);
-                """,
-                
-                # Individual indexes for course registration
-                """
-                CREATE INDEX IF NOT EXISTS idx_course_reg_session_semester_course 
-                ON course_registration(session, semester_type, course_id_id);
-                """,
-                
-                """
-                CREATE INDEX IF NOT EXISTS idx_course_reg_student 
-                ON course_registration(student_id_id);
-                """,
-                
-                """
-                CREATE INDEX IF NOT EXISTS idx_course_reg_type 
-                ON course_registration(registration_type);
-                """
-            ],
-            
-            # Reverse migration to drop indexes
+            sql="""
+                DO $$
+                BEGIN
+                    IF to_regclass('public.course_registration') IS NOT NULL THEN
+                        CREATE INDEX IF NOT EXISTS idx_course_reg_main_query
+                        ON course_registration(session, semester_type, course_id_id, registration_type, student_id_id);
+
+                        CREATE INDEX IF NOT EXISTS idx_course_reg_session_semester_course
+                        ON course_registration(session, semester_type, course_id_id);
+
+                        CREATE INDEX IF NOT EXISTS idx_course_reg_student
+                        ON course_registration(student_id_id);
+
+                        CREATE INDEX IF NOT EXISTS idx_course_reg_type
+                        ON course_registration(registration_type);
+                    END IF;
+                END
+                $$;
+            """,
             reverse_sql=[
                 "DROP INDEX IF EXISTS idx_course_reg_main_query;",
                 "DROP INDEX IF EXISTS idx_course_reg_session_semester_course;",
