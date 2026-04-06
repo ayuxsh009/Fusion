@@ -1,10 +1,21 @@
+from datetime import date
+
 from rest_framework import serializers
 
 from applications.central_mess.models import (
+    AccessViolationLog,
     Announcement,
+    AuditLog,
     Deregistration_Request,
+    FeedbackReport,
     MenuPoll,
     MenuPollVote,
+    NotificationLog,
+    RefundLedger,
+    RefundRequest,
+    RoleAssignment,
+    RoleTransferLog,
+    SpecialEventMeal,
     VacationSurvey,
     VacationSurveyResponse,
     Feedback,
@@ -447,3 +458,106 @@ class VacationSurveyResponseSerializer(serializers.ModelSerializer):
         model = VacationSurveyResponse
         fields = "__all__"
         extra_kwargs = {"student_id": {"required": False}}
+
+
+class RefundRequestSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = RefundRequest
+        fields = "__all__"
+        extra_kwargs = {
+            "student_id": {"required": False},
+            "reviewer": {"required": False},
+        }
+
+    def validate_amount(self, value):
+        if value <= 0:
+            raise serializers.ValidationError("amount must be greater than 0.")
+        return value
+
+
+class RefundDecisionSerializer(serializers.Serializer):
+    id = serializers.IntegerField(min_value=1)
+    status = serializers.CharField()
+    reviewer_remark = serializers.CharField(required=False, allow_blank=True)
+    reference_no = serializers.CharField(required=False, allow_blank=True)
+
+    def validate_status(self, value):
+        status = _normalize_status(value)
+        if status not in {"approved", "rejected"}:
+            raise serializers.ValidationError("status must be approved or rejected.")
+        return status
+
+
+class RefundCancelSerializer(serializers.Serializer):
+    id = serializers.IntegerField(min_value=1)
+
+
+class RefundLedgerSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = RefundLedger
+        fields = "__all__"
+
+
+class SpecialEventMealSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = SpecialEventMeal
+        fields = "__all__"
+        extra_kwargs = {"created_by": {"required": False}}
+
+    def validate(self, attrs):
+        event_date = attrs.get("event_date")
+        if event_date and event_date < date.today():
+            raise serializers.ValidationError(
+                {"event_date": "event_date cannot be in the past."}
+            )
+        return attrs
+
+
+class RoleAssignmentSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = RoleAssignment
+        fields = "__all__"
+
+
+class RoleAssignmentActionSerializer(serializers.Serializer):
+    role_type = serializers.CharField()
+    assignee_username = serializers.CharField()
+    start_date = serializers.DateField(required=False)
+    end_date = serializers.DateField(required=False, allow_null=True)
+    reason = serializers.CharField(required=False, allow_blank=True)
+
+    def validate_role_type(self, value):
+        role = _normalize_status(value)
+        if role not in {"caretaker", "warden"}:
+            raise serializers.ValidationError("role_type must be caretaker or warden.")
+        return role
+
+
+class RoleTransferLogSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = RoleTransferLog
+        fields = "__all__"
+
+
+class AuditLogSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = AuditLog
+        fields = "__all__"
+
+
+class AccessViolationLogSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = AccessViolationLog
+        fields = "__all__"
+
+
+class NotificationLogSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = NotificationLog
+        fields = "__all__"
+
+
+class FeedbackReportSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = FeedbackReport
+        fields = "__all__"

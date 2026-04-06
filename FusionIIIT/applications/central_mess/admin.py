@@ -3,7 +3,10 @@ from django.contrib import admin
 from .models import (Feedback, Menu, Menu_change_request, Mess_meeting,
                      Mess_minutes, Mess_reg, Messinfo, Monthly_bill,
                      Payments, Rebate,
-                     Special_request, Vacation_food,MessBillBase, Registration_Request, Reg_records, Reg_main)
+                     Special_request, Vacation_food, MessBillBase, Registration_Request, Reg_records, Reg_main,
+                     AccessViolationLog, AuditLog, FeedbackReport, NotificationLog,
+                     RefundLedger, RefundRequest, RoleAssignment, RoleTransferLog,
+                     SpecialEventMeal)
 
 # Register your models here.
 
@@ -215,3 +218,12 @@ admin.site.register(Menu_change_request, Menu_change_requestAdmin)
 admin.site.register(Reg_main,Reg_mainAdmin)
 admin.site.register(Reg_records,Reg_recordsAdmin)
 admin.site.register(Registration_Request,Registration_RequestAdmin)
+admin.site.register(AuditLog)
+admin.site.register(AccessViolationLog)
+admin.site.register(NotificationLog)
+admin.site.register(RefundRequest)
+admin.site.register(RefundLedger)
+admin.site.register(SpecialEventMeal)
+admin.site.register(RoleAssignment)
+admin.site.register(RoleTransferLog)
+admin.site.register(FeedbackReport)

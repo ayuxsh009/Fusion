@@ -30,4 +30,10 @@ urlpatterns = [
     path("adminMessManagementApi/", views.AdminMessManagementApi.as_view(), name="adminMessManagementApi"),
     path("menuPollApi/", views.MenuPollApi.as_view(), name="menuPollApi"),
     path("vacationSurveyApi/", views.VacationSurveyApi.as_view(), name="vacationSurveyApi"),
+    path("refundRequestApi/", views.RefundRequestApi.as_view(), name="refundRequestApi"),
+    path("refundLedgerApi/", views.RefundLedgerApi.as_view(), name="refundLedgerApi"),
+    path("specialEventMealApi/", views.SpecialEventMealApi.as_view(), name="specialEventMealApi"),
+    path("roleAssignmentApi/", views.RoleAssignmentApi.as_view(), name="roleAssignmentApi"),
+    path("auditComplianceApi/", views.AuditAndComplianceApi.as_view(), name="auditComplianceApi"),
+    path("feedbackReportApi/", views.FeedbackReportApi.as_view(), name="feedbackReportApi"),
 ]

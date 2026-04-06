@@ -4,16 +4,28 @@ Central Mess selector layer.
 Read/query helpers live here to keep ORM access centralized and reusable.
 """
 
+from datetime import date, timedelta
+
 from django.shortcuts import get_object_or_404
+from django.db.models import Q
 
 from applications.academic_information.models import Student
 from applications.globals.models import ExtraInfo, HoldsDesignation
 
 from .models import (
+    AccessViolationLog,
     Announcement,
+    AuditLog,
     Deregistration_Request,
+    FeedbackReport,
     MenuPoll,
     MenuPollVote,
+    NotificationLog,
+    RefundLedger,
+    RefundRequest,
+    RoleAssignment,
+    RoleTransferLog,
+    SpecialEventMeal,
     VacationSurvey,
     VacationSurveyResponse,
     Feedback,
@@ -261,7 +273,16 @@ def get_reg_records_queryset(student=None):
 # ---------------------------------------------------------------------------
 
 def get_announcement_queryset(mess_option=None):
-    qs = Announcement.objects.select_related("created_by", "created_by__user").all()
+    today = date.today()
+    archive_before = today - timedelta(days=90)
+    Announcement.objects.filter(
+        is_archived=False,
+    ).filter(
+        Q(expiry_date__lt=today) | Q(created_at__date__lt=archive_before)
+    ).update(is_archived=True)
+
+    qs = Announcement.objects.select_related("created_by", "created_by__user").filter(is_archived=False)
+    qs = qs.filter(Q(expiry_date__isnull=True) | Q(expiry_date__gte=today))
     if mess_option and mess_option != "all":
         qs = qs.filter(mess_option__in=[mess_option, "all"])
     return qs
@@ -272,11 +293,16 @@ def get_announcement_queryset(mess_option=None):
 # ---------------------------------------------------------------------------
 
 def get_poll_queryset(mess_option=None, active_only=False):
+    MenuPoll.objects.filter(is_active=True, end_date__lt=date.today()).update(
+        is_active=False
+    )
     qs = MenuPoll.objects.prefetch_related("votes").all()
     if mess_option and mess_option != "all":
         qs = qs.filter(mess_option__in=[mess_option, "all"])
     if active_only:
-        qs = qs.filter(is_active=True)
+        qs = qs.filter(is_active=True).filter(
+            Q(end_date__isnull=True) | Q(end_date__gte=date.today())
+        )
     return qs
 
 
@@ -291,3 +317,81 @@ def get_vacation_survey_queryset(mess_option=None, active_only=False):
     if active_only:
         qs = qs.filter(is_active=True)
     return qs
+
+
+# ---------------------------------------------------------------------------
+# Refunds
+# ---------------------------------------------------------------------------
+
+def get_refund_request_queryset(student=None, status=None):
+    qs = RefundRequest.objects.select_related("student_id", "reviewer", "reviewer__user").all()
+    if student is not None:
+        qs = qs.filter(student_id=student)
+    if status:
+        qs = qs.filter(status=status)
+    return qs
+
+
+def get_refund_ledger_queryset(student=None):
+    qs = RefundLedger.objects.select_related(
+        "refund_request",
+        "refund_request__student_id",
+        "processed_by",
+        "processed_by__user",
+    ).all()
+    if student is not None:
+        qs = qs.filter(refund_request__student_id=student)
+    return qs
+
+
+# ---------------------------------------------------------------------------
+# Special Events Meals
+# ---------------------------------------------------------------------------
+
+def get_special_event_meal_queryset(mess_option=None, active_only=False):
+    qs = SpecialEventMeal.objects.select_related("created_by", "created_by__user").all()
+    if mess_option and mess_option != "all":
+        qs = qs.filter(mess_option__in=[mess_option, "all"])
+    if active_only:
+        qs = qs.filter(is_active=True)
+    return qs
+
+
+# ---------------------------------------------------------------------------
+# Role Assignment / Transfer
+# ---------------------------------------------------------------------------
+
+def get_role_assignment_queryset(role_type=None, active_only=False):
+    qs = RoleAssignment.objects.select_related("assignee", "assigned_by").all()
+    if role_type:
+        qs = qs.filter(role_type=role_type)
+    if active_only:
+        qs = qs.filter(is_active=True)
+    return qs
+
+
+def get_role_transfer_log_queryset(role_type=None):
+    qs = RoleTransferLog.objects.select_related("previous_assignee", "new_assignee").all()
+    if role_type:
+        qs = qs.filter(role_type=role_type)
+    return qs
+
+
+# ---------------------------------------------------------------------------
+# Audit / Notifications
+# ---------------------------------------------------------------------------
+
+def get_audit_log_queryset():
+    return AuditLog.objects.select_related("actor").all()
+
+
+def get_access_violation_queryset():
+    return AccessViolationLog.objects.select_related("user").all()
+
+
+def get_notification_log_queryset():
+    return NotificationLog.objects.select_related("recipient").all()
+
+
+def get_feedback_report_queryset():
+    return FeedbackReport.objects.select_related("generated_by", "generated_by__user").all()

@@ -1,5 +1,6 @@
 import datetime
 from django.db import models
+from django.contrib.auth.models import User
 from applications.academic_information.models import (Student, Holiday)
 
 # Create your models here.
@@ -99,6 +100,18 @@ MESS_OPTION = (
     ('mess2', 'Mess2')
 )
 
+ROLE_TYPE = (
+    ('caretaker', 'Caretaker'),
+    ('warden', 'Warden'),
+)
+
+REFUND_STATUS = (
+    ('pending', 'Pending'),
+    ('approved', 'Approved'),
+    ('rejected', 'Rejected'),
+    ('cancelled', 'Cancelled'),
+)
+
 
 class Messinfo(models.Model):
     student_id = models.ForeignKey(Student, on_delete=models.CASCADE)
@@ -141,6 +154,10 @@ class Monthly_bill(models.Model):
     # nonveg_total_bill = models.IntegerField(default=0)
     total_bill = models.IntegerField(default=0)
     paid = models.BooleanField(default=False)
+    generated_on = models.DateField(default=datetime.date.today)
+    due_date = models.DateField(null=True, blank=True)
+    late_fee = models.IntegerField(default=0)
+    escalated_for_nonpayment = models.BooleanField(default=False)
 
     class Meta:
         unique_together = (('student_id', 'month', 'year'),)
@@ -185,6 +202,10 @@ class Rebate(models.Model):
     leave_type = models.CharField(choices=LEAVE_TYPE, max_length=20, default="casual")
     # leave_document = models.FileField(upload_to='central_mess/')
     rebate_remark = models.CharField(max_length=50,default='NA')
+    reviewed_at = models.DateTimeField(null=True, blank=True)
+    is_escalated = models.BooleanField(default=False)
+    escalated_at = models.DateTimeField(null=True, blank=True)
+
     def __str__(self):
         return str(self.student_id.id)
 
@@ -402,6 +423,7 @@ class MenuPollVote(models.Model):
     poll = models.ForeignKey(MenuPoll, on_delete=models.CASCADE, related_name='votes')
     student_id = models.ForeignKey(Student, on_delete=models.CASCADE)
     selected_option = models.PositiveSmallIntegerField()  # 1, 2, 3, or 4
+    voter_hash = models.CharField(max_length=64, blank=True, default='')
     voted_at = models.DateTimeField(auto_now_add=True)
 
     class Meta:
@@ -420,9 +442,123 @@ class Announcement(models.Model):
     )
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
+    expiry_date = models.DateField(null=True, blank=True)
+    is_archived = models.BooleanField(default=False)
 
     class Meta:
         ordering = ['-created_at']
 
     def __str__(self):
         return self.title
+
+
+class AuditLog(models.Model):
+    actor = models.ForeignKey(User, on_delete=models.SET_NULL, null=True, blank=True)
+    action = models.CharField(max_length=120)
+    entity_type = models.CharField(max_length=120)
+    entity_id = models.CharField(max_length=120, blank=True, default='')
+    details = models.TextField(blank=True, default='')
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ['-created_at']
+
+
+class AccessViolationLog(models.Model):
+    user = models.ForeignKey(User, on_delete=models.SET_NULL, null=True, blank=True)
+    endpoint = models.CharField(max_length=255)
+    method = models.CharField(max_length=10)
+    reason = models.TextField()
+    occurred_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ['-occurred_at']
+
+
+class NotificationLog(models.Model):
+    event_type = models.CharField(max_length=100)
+    channel = models.CharField(max_length=50)  # portal/email
+    recipient = models.ForeignKey(User, on_delete=models.SET_NULL, null=True, blank=True)
+    message = models.TextField()
+    retries = models.PositiveSmallIntegerField(default=0)
+    status = models.CharField(max_length=30, default='pending')  # pending/sent/failed
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ['-created_at']
+
+
+class RefundRequest(models.Model):
+    student_id = models.ForeignKey(Student, on_delete=models.CASCADE)
+    amount = models.PositiveIntegerField()
+    reason = models.TextField()
+    finance_cleared = models.BooleanField(default=False)
+    status = models.CharField(max_length=20, choices=REFUND_STATUS, default='pending')
+    reviewer = models.ForeignKey('globals.ExtraInfo', on_delete=models.SET_NULL, null=True, blank=True)
+    reviewer_remark = models.CharField(max_length=200, blank=True, default='')
+    created_at = models.DateTimeField(auto_now_add=True)
+    reviewed_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        ordering = ['-created_at']
+
+
+class RefundLedger(models.Model):
+    refund_request = models.OneToOneField(RefundRequest, on_delete=models.CASCADE, related_name='ledger_entry')
+    amount = models.PositiveIntegerField()
+    reference_no = models.CharField(max_length=100, blank=True, default='')
+    processed_by = models.ForeignKey('globals.ExtraInfo', on_delete=models.SET_NULL, null=True, blank=True)
+    processed_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ['-processed_at']
+
+
+class SpecialEventMeal(models.Model):
+    title = models.CharField(max_length=200)
+    event_date = models.DateField()
+    mess_option = models.CharField(max_length=20, choices=MESS_OPTION + (('all', 'All'),), default='all')
+    menu = models.TextField()
+    budget_approved = models.BooleanField(default=False)
+    is_active = models.BooleanField(default=True)
+    created_by = models.ForeignKey('globals.ExtraInfo', on_delete=models.SET_NULL, null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ['-event_date', '-created_at']
+
+
+class RoleAssignment(models.Model):
+    role_type = models.CharField(max_length=20, choices=ROLE_TYPE)
+    assignee = models.ForeignKey(User, on_delete=models.CASCADE, related_name='mess_role_assignments')
+    assigned_by = models.ForeignKey(User, on_delete=models.SET_NULL, null=True, blank=True, related_name='mess_role_assigned_by')
+    start_date = models.DateField(default=datetime.date.today)
+    end_date = models.DateField(null=True, blank=True)
+    is_active = models.BooleanField(default=True)
+    reason = models.CharField(max_length=200, blank=True, default='')
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ['-created_at']
+
+
+class RoleTransferLog(models.Model):
+    role_type = models.CharField(max_length=20, choices=ROLE_TYPE)
+    previous_assignee = models.ForeignKey(User, on_delete=models.SET_NULL, null=True, blank=True, related_name='mess_role_previous_transfers')
+    new_assignee = models.ForeignKey(User, on_delete=models.CASCADE, related_name='mess_role_new_transfers')
+    transferred_pending_count = models.PositiveIntegerField(default=0)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ['-created_at']
+
+
+class FeedbackReport(models.Model):
+    week_start = models.DateField()
+    week_end = models.DateField()
+    generated_by = models.ForeignKey('globals.ExtraInfo', on_delete=models.SET_NULL, null=True, blank=True)
+    report_snapshot = models.TextField(default='')
+    generated_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ['-generated_at']

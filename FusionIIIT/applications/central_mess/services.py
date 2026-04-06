@@ -1,8 +1,12 @@
+import hashlib
+import json
+from django.conf import settings
 from django.core.exceptions import ObjectDoesNotExist
 from datetime import date, datetime
 from datetime import timedelta
 from threading import Thread
 from django.contrib.auth.decorators import login_required
+from django.core.mail import send_mail
 from django.db import transaction
 from django.http import HttpResponse, HttpResponseRedirect, JsonResponse
 from django.shortcuts import redirect, render
@@ -10,13 +14,47 @@ from django.views.decorators.csrf import csrf_exempt
 from django.contrib import messages
 from django.views.generic import View
 from django.db.models import F, Q
+from django.db import close_old_connections
 from django.contrib.auth.models import User
 from applications.academic_information.models import Student
 from applications.globals.models import ExtraInfo, HoldsDesignation, Designation
 from django.shortcuts import get_object_or_404
-from .models import (Announcement, Feedback, Menu, MenuPoll, MenuPollVote, VacationSurvey, VacationSurveyResponse, Menu_change_request, Mess_meeting,
-                     Mess_minutes, Mess_reg, Messinfo, Monthly_bill, Update_Payment,
-                      Payments, Rebate,Special_request, Vacation_food, MessBillBase,Registration_Request, Reg_main, Reg_records ,Deregistration_Request, Semdates)
+from notifications.signals import notify
+from .models import (
+    AccessViolationLog,
+    Announcement,
+    AuditLog,
+    Feedback,
+    FeedbackReport,
+    Menu,
+    MenuPoll,
+    MenuPollVote,
+    NotificationLog,
+    RefundLedger,
+    RefundRequest,
+    RoleAssignment,
+    RoleTransferLog,
+    SpecialEventMeal,
+    VacationSurvey,
+    VacationSurveyResponse,
+    Menu_change_request,
+    Mess_meeting,
+    Mess_minutes,
+    Mess_reg,
+    Messinfo,
+    Monthly_bill,
+    Update_Payment,
+    Payments,
+    Rebate,
+    Special_request,
+    Vacation_food,
+    MessBillBase,
+    Registration_Request,
+    Reg_main,
+    Reg_records,
+    Deregistration_Request,
+    Semdates,
+)
 from notification.views import central_mess_notif
 from .selectors import get_student_from_request_user
 
@@ -41,6 +79,194 @@ def current_month():
 
 def current_year():
     return date.today().strftime("%Y")
+
+
+MANAGER_DESIGNATIONS = {"mess_manager"}
+WARDEN_DESIGNATIONS = {"mess_warden"}
+ADMIN_DESIGNATIONS = {"mess_admin"}
+COMMITTEE_OR_CONVENER_DESIGNATIONS = {
+    "mess_committee",
+    "mess_committee_mess2",
+    "mess_convener",
+}
+PAYMENT_GRACE_DAYS = 10
+PAYMENT_ESCALATION_DAYS = 30
+DEFAULT_LATE_FEE = 100
+
+
+def _designation_names_for_user(user):
+    return {
+        str(name).strip().lower()
+        for name in HoldsDesignation.objects.select_related("designation")
+        .filter(user=user)
+        .values_list("designation__name", flat=True)
+    }
+
+
+def _require_designation(user, allowed_designations, *, allow_staff=False):
+    allowed = {str(name).strip().lower() for name in allowed_designations}
+    user_designations = _designation_names_for_user(user)
+    if user_designations.intersection(allowed):
+        return
+    if allow_staff and getattr(user, "is_staff", False):
+        return
+    raise CentralMessServiceError(
+        "You are not authorized to perform this action.",
+        status_code=403,
+    )
+
+
+def _log_audit(action, entity_type, entity_id="", *, actor=None, details=""):
+    AuditLog.objects.create(
+        actor=actor if actor and actor.is_authenticated else None,
+        action=action,
+        entity_type=entity_type,
+        entity_id=str(entity_id or ""),
+        details=details or "",
+    )
+
+
+def _log_access_violation(user, endpoint, method, reason):
+    AccessViolationLog.objects.create(
+        user=user if user and user.is_authenticated else None,
+        endpoint=endpoint or "",
+        method=(method or "").upper(),
+        reason=reason or "Unauthorized access attempt.",
+    )
+
+
+def _humanize_event_type(event_type):
+    return str(event_type or "central_mess_update").replace("_", " ").strip().title()
+
+
+def _notify_users_sync(
+    event_type,
+    recipient_user_ids,
+    message,
+    *,
+    actor_user_id=None,
+    channels=("portal", "email"),
+    retries=1,
+):
+    close_old_connections()
+    actor_user = None
+    if actor_user_id:
+        actor_user = User.objects.filter(id=actor_user_id).first()
+
+    email_configured = bool(getattr(settings, "EMAIL_HOST", ""))
+    recipient_users = list(User.objects.filter(id__in=recipient_user_ids))
+
+    for user in recipient_users:
+        for channel in channels:
+            if channel == "email" and not email_configured:
+                NotificationLog.objects.create(
+                    event_type=event_type,
+                    channel=channel,
+                    recipient=user,
+                    message=message,
+                    retries=0,
+                    status="skipped",
+                )
+                continue
+
+            status_value = "pending"
+            attempts = 0
+            for attempt in range(1, retries + 1):
+                attempts = attempt
+                try:
+                    if channel == "portal":
+                        actor = actor_user or user
+                        description = (message or "").strip() or _humanize_event_type(event_type)
+                        notify.send(
+                            sender=actor,
+                            recipient=user,
+                            url="mess:mess",
+                            module="Central Mess",
+                            verb=_humanize_event_type(event_type),
+                            description=description,
+                        )
+                    elif channel == "email":
+                        if user.email:
+                            send_mail(
+                                subject=f"[Fusion Mess] {_humanize_event_type(event_type)}",
+                                message=message,
+                                from_email=None,
+                                recipient_list=[user.email],
+                                fail_silently=False,
+                            )
+                    status_value = "sent"
+                    break
+                except Exception:
+                    status_value = "failed"
+
+            NotificationLog.objects.create(
+                event_type=event_type,
+                channel=channel,
+                recipient=user,
+                message=message,
+                retries=attempts,
+                status=status_value,
+            )
+
+
+def _notify_users(event_type, recipients, message, *, actor_user=None, channels=("portal", "email"), retries=1):
+    """
+    Queue notifications asynchronously so request-response paths stay fast.
+    Delivery starts after successful transaction commit.
+    """
+    recipient_user_ids = sorted(
+        {
+            user.id
+            for user in recipients
+            if user is not None and getattr(user, "id", None)
+        }
+    )
+    if not recipient_user_ids:
+        return
+
+    actor_user_id = (
+        actor_user.id
+        if actor_user is not None and getattr(actor_user, "is_authenticated", False)
+        else None
+    )
+
+    def _dispatch():
+        worker = Thread(
+            target=_notify_users_sync,
+            kwargs={
+                "event_type": event_type,
+                "recipient_user_ids": recipient_user_ids,
+                "message": message,
+                "actor_user_id": actor_user_id,
+                "channels": channels,
+                "retries": retries,
+            },
+            daemon=True,
+        )
+        worker.start()
+
+    try:
+        transaction.on_commit(_dispatch)
+    except Exception:
+        _dispatch()
+
+
+def _get_users_by_designations(designation_names):
+    names = {str(name).strip().lower() for name in designation_names}
+    return list(
+        User.objects.filter(
+            id__in=HoldsDesignation.objects.select_related("designation")
+            .filter(designation__name__in=names)
+            .values_list("user_id", flat=True)
+        ).distinct()
+    )
+
+
+def _student_user(student):
+    try:
+        return student.id.user
+    except Exception:
+        return None
 
 # def add_nonveg_order(request, student):
 #     """
@@ -990,21 +1216,38 @@ def create_mess_reg(validated_data):
 
 
 def create_mess_bill_base(validated_data):
-    return MessBillBase.objects.create(**validated_data)
+    obj = MessBillBase.objects.create(**validated_data)
+    _log_audit(
+        "mess_bill_base_created",
+        "MessBillBase",
+        obj.id,
+        details=f"bill_amount={obj.bill_amount}",
+    )
+    return obj
 
 
 def create_menu(validated_data):
     return Menu.objects.create(**validated_data)
 
 
-def update_menu_items(mess_option, items):
+def update_menu_items(mess_option, items, *, request_user=None):
     """Bulk update-or-create menu items for a given mess."""
+    if request_user is not None:
+        _require_designation(request_user, MANAGER_DESIGNATIONS, allow_staff=True)
+
     for item in items:
         Menu.objects.update_or_create(
             mess_option=mess_option,
             meal_time=item['meal_time'],
             defaults={'dish': item['dish']},
         )
+    _log_audit(
+        "menu_updated",
+        "Menu",
+        mess_option,
+        actor=request_user,
+        details=f"items_count={len(items)}",
+    )
 
 
 def create_monthly_bill(validated_data):
@@ -1013,6 +1256,8 @@ def create_monthly_bill(validated_data):
     rebate_count = payload.get("rebate_count", 0)
     rebate_amount = payload.get("rebate_amount", 0)
     total_bill = amount - (rebate_count * rebate_amount)
+    generated_on = payload.get("generated_on") or date.today()
+    due_date = payload.get("due_date") or (generated_on + timedelta(days=PAYMENT_GRACE_DAYS))
 
     obj, _ = Monthly_bill.objects.update_or_create(
         student_id=payload["student_id"],
@@ -1024,7 +1269,15 @@ def create_monthly_bill(validated_data):
             "rebate_amount": rebate_amount,
             "total_bill": total_bill,
             "paid": payload.get("paid", False),
+            "generated_on": generated_on,
+            "due_date": due_date,
         },
+    )
+    _log_audit(
+        "monthly_bill_upserted",
+        "Monthly_bill",
+        obj.id,
+        details=f"total_bill={obj.total_bill}, due_date={obj.due_date}",
     )
     return obj
 
@@ -1075,10 +1328,32 @@ def create_rebate(validated_data, *, request_user):
                 payload={"status": 3, "message": f"Maximum 20 rebate days allowed per semester. Used: {used_days}/20."},
             )
 
-    return Rebate.objects.create(**payload)
+    rebate = Rebate.objects.create(**payload)
+    _log_audit(
+        "rebate_created",
+        "Rebate",
+        rebate.id,
+        actor=request_user,
+        details=f"{rebate.start_date} to {rebate.end_date}",
+    )
+    reviewer_users = _get_users_by_designations(MANAGER_DESIGNATIONS.union(WARDEN_DESIGNATIONS))
+    _notify_users(
+        "rebate_created",
+        reviewer_users,
+        f"New rebate request submitted by {rebate.student_id}.",
+        actor_user=request_user,
+    )
+    return rebate
 
 
-def update_rebate_status(validated_data):
+def update_rebate_status(validated_data, *, request_user=None):
+    if request_user is not None:
+        _require_designation(
+            request_user,
+            MANAGER_DESIGNATIONS.union(WARDEN_DESIGNATIONS),
+            allow_staff=True,
+        )
+
     rebate = get_object_or_404(
         Rebate,
         student_id=validated_data["student_id"],
@@ -1088,9 +1363,44 @@ def update_rebate_status(validated_data):
         app_date=validated_data["app_date"],
         leave_type=validated_data["leave_type"],
     )
-    rebate.status = validated_data["status"]
-    rebate.rebate_remark = validated_data.get("rebate_remark", rebate.rebate_remark)
-    rebate.save(update_fields=["status", "rebate_remark"])
+    new_status = str(validated_data["status"])
+    remark = validated_data.get("rebate_remark", "")
+    if new_status in {"0", "2"} and not remark.strip():
+        raise CentralMessServiceError("Remark is mandatory for approve/reject decisions.", status_code=400)
+
+    old_status = str(rebate.status)
+    rebate.status = new_status
+    rebate.rebate_remark = remark or rebate.rebate_remark
+    rebate.reviewed_at = datetime.now()
+    if rebate.is_escalated:
+        rebate.is_escalated = False
+    rebate.save(update_fields=["status", "rebate_remark", "reviewed_at", "is_escalated"])
+
+    actor_role = _designation_names_for_user(request_user) if request_user else set()
+    if old_status in {"0", "2"} and request_user and actor_role.intersection(WARDEN_DESIGNATIONS):
+        _log_audit(
+            "rebate_overridden_by_warden",
+            "Rebate",
+            rebate.id,
+            actor=request_user,
+            details=f"old_status={old_status}, new_status={new_status}, remark={remark}",
+        )
+    else:
+        _log_audit(
+            "rebate_reviewed",
+            "Rebate",
+            rebate.id,
+            actor=request_user,
+            details=f"status={new_status}, remark={remark}",
+        )
+
+    student_user = _student_user(rebate.student_id)
+    _notify_users(
+        "rebate_reviewed",
+        [student_user],
+        f"Your rebate request has been {'approved' if new_status == '2' else 'rejected'}.",
+        actor_user=request_user,
+    )
     return rebate
 
 
@@ -1140,10 +1450,32 @@ def create_special_request(validated_data, *, request_user):
                 status_code=400,
             )
 
-    return Special_request.objects.create(**payload)
+    obj = Special_request.objects.create(**payload)
+    _log_audit(
+        "special_request_created",
+        "Special_request",
+        obj.id,
+        actor=request_user,
+        details=f"{obj.start_date} to {obj.end_date}",
+    )
+    reviewer_users = _get_users_by_designations(MANAGER_DESIGNATIONS.union(WARDEN_DESIGNATIONS))
+    _notify_users(
+        "special_request_created",
+        reviewer_users,
+        f"New special food request submitted by {obj.student_id}.",
+        actor_user=request_user,
+    )
+    return obj
 
 
-def update_special_request_status(validated_data):
+def update_special_request_status(validated_data, *, request_user=None):
+    if request_user is not None:
+        _require_designation(
+            request_user,
+            MANAGER_DESIGNATIONS.union(WARDEN_DESIGNATIONS),
+            allow_staff=True,
+        )
+
     request_obj = get_object_or_404(
         Special_request,
         student_id=validated_data["student_id"],
@@ -1156,6 +1488,19 @@ def update_special_request_status(validated_data):
     )
     request_obj.status = validated_data["status"]
     request_obj.save(update_fields=["status"])
+    _log_audit(
+        "special_request_reviewed",
+        "Special_request",
+        request_obj.id,
+        actor=request_user,
+        details=f"status={request_obj.status}",
+    )
+    _notify_users(
+        "special_request_reviewed",
+        [_student_user(request_obj.student_id)],
+        f"Your special food request has been {'approved' if str(request_obj.status) == '2' else 'rejected'}.",
+        actor_user=request_user,
+    )
     return request_obj
 
 
@@ -1163,6 +1508,20 @@ def create_registration_request(validated_data, *, request_user):
     payload = dict(validated_data)
     payload.pop("mess_option", None)
     student = _get_student(payload, request_user=request_user)
+
+    today = date.today()
+    reg_window = Mess_reg.objects.order_by("-end_reg", "-start_reg").first()
+    if reg_window is None:
+        raise CentralMessServiceError(
+            "Registration window is not configured.",
+            status_code=400,
+        )
+
+    if not (reg_window.start_reg <= today <= reg_window.end_reg):
+        raise CentralMessServiceError(
+            f"Registration is allowed only between {reg_window.start_reg} and {reg_window.end_reg}.",
+            status_code=400,
+        )
 
     reg_main = Reg_main.objects.filter(student_id=student).first()
     if reg_main and str(reg_main.current_mess_status).lower() == "registered":
@@ -1182,11 +1541,32 @@ def create_registration_request(validated_data, *, request_user):
         )
 
     payload["student_id"] = student
-    return Registration_Request.objects.create(**payload)
+    request_obj = Registration_Request.objects.create(**payload)
+    _log_audit(
+        "registration_request_created",
+        "Registration_Request",
+        request_obj.id,
+        actor=request_user,
+    )
+    reviewer_users = _get_users_by_designations(MANAGER_DESIGNATIONS.union(WARDEN_DESIGNATIONS))
+    _notify_users(
+        "registration_request_created",
+        reviewer_users,
+        f"New registration request submitted by {student}.",
+        actor_user=request_user,
+    )
+    return request_obj
 
 
 @transaction.atomic
-def decide_registration_request(validated_data):
+def decide_registration_request(validated_data, *, request_user=None):
+    if request_user is not None:
+        _require_designation(
+            request_user,
+            MANAGER_DESIGNATIONS.union(WARDEN_DESIGNATIONS),
+            allow_staff=True,
+        )
+
     request_obj = get_object_or_404(
         Registration_Request,
         student_id=validated_data["student_id"],
@@ -1239,6 +1619,20 @@ def decide_registration_request(validated_data):
             end_date=None,
         )
 
+    _log_audit(
+        "registration_request_reviewed",
+        "Registration_Request",
+        request_obj.id,
+        actor=request_user,
+        details=f"status={new_status}",
+    )
+    _notify_users(
+        "registration_request_reviewed",
+        [_student_user(request_obj.student_id)],
+        f"Your registration request has been {new_status}.",
+        actor_user=request_user,
+    )
+
     return request_obj
 
 
@@ -1253,6 +1647,21 @@ def create_deregistration_request(validated_data, *, request_user):
             status_code=400,
         )
 
+    if reg_main.balance < 0:
+        raise CentralMessServiceError(
+            "Deregistration is not allowed while pending dues exist.",
+            status_code=400,
+        )
+
+    end_date = payload.get("end_date")
+    if end_date is not None:
+        first_day_next_month = (date.today().replace(day=28) + timedelta(days=4)).replace(day=1)
+        if end_date < first_day_next_month:
+            raise CentralMessServiceError(
+                f"Deregistration end_date must be on or after {first_day_next_month}.",
+                status_code=400,
+            )
+
     pending_deregistration_exists = Deregistration_Request.objects.filter(
         student_id=student,
         status__iexact="pending",
@@ -1264,7 +1673,21 @@ def create_deregistration_request(validated_data, *, request_user):
         )
 
     payload["student_id"] = student
-    return Deregistration_Request.objects.create(**payload)
+    request_obj = Deregistration_Request.objects.create(**payload)
+    _log_audit(
+        "deregistration_request_created",
+        "Deregistration_Request",
+        request_obj.id,
+        actor=request_user,
+    )
+    reviewer_users = _get_users_by_designations(MANAGER_DESIGNATIONS.union(WARDEN_DESIGNATIONS))
+    _notify_users(
+        "deregistration_request_created",
+        reviewer_users,
+        f"New deregistration request submitted by {student}.",
+        actor_user=request_user,
+    )
+    return request_obj
 
 
 def delete_deregistration_request(validated_data, *, request_user):
@@ -1289,7 +1712,14 @@ def delete_deregistration_request(validated_data, *, request_user):
 
 
 @transaction.atomic
-def decide_deregistration_request(validated_data):
+def decide_deregistration_request(validated_data, *, request_user=None):
+    if request_user is not None:
+        _require_designation(
+            request_user,
+            MANAGER_DESIGNATIONS.union(WARDEN_DESIGNATIONS),
+            allow_staff=True,
+        )
+
     request_obj = get_object_or_404(
         Deregistration_Request,
         student_id=validated_data["student_id"],
@@ -1319,17 +1749,52 @@ def decide_deregistration_request(validated_data):
             reg_record.end_date = request_obj.end_date
             reg_record.save(update_fields=["end_date"])
 
+    _log_audit(
+        "deregistration_request_reviewed",
+        "Deregistration_Request",
+        request_obj.id,
+        actor=request_user,
+        details=f"status={new_status}",
+    )
+    _notify_users(
+        "deregistration_request_reviewed",
+        [_student_user(request_obj.student_id)],
+        f"Your deregistration request has been {new_status}.",
+        actor_user=request_user,
+    )
+
     return request_obj
 
 
 def create_update_payment_request(validated_data, *, request_user):
     payload = dict(validated_data)
     payload["student_id"] = _get_student(payload, request_user=request_user)
-    return Update_Payment.objects.create(**payload)
+    obj = Update_Payment.objects.create(**payload)
+    _log_audit(
+        "update_payment_request_created",
+        "Update_Payment",
+        obj.id,
+        actor=request_user,
+    )
+    reviewer_users = _get_users_by_designations(MANAGER_DESIGNATIONS.union(WARDEN_DESIGNATIONS))
+    _notify_users(
+        "update_payment_request_created",
+        reviewer_users,
+        f"New payment-update request submitted by {obj.student_id}.",
+        actor_user=request_user,
+    )
+    return obj
 
 
 @transaction.atomic
-def decide_update_payment_request(validated_data):
+def decide_update_payment_request(validated_data, *, request_user=None):
+    if request_user is not None:
+        _require_designation(
+            request_user,
+            MANAGER_DESIGNATIONS.union(WARDEN_DESIGNATIONS),
+            allow_staff=True,
+        )
+
     request_obj = get_object_or_404(
         Update_Payment,
         student_id=validated_data["student_id"],
@@ -1363,6 +1828,20 @@ def decide_update_payment_request(validated_data):
         reg_main.balance = F("balance") + amount
         reg_main.save(update_fields=["balance"])
 
+    _log_audit(
+        "update_payment_request_reviewed",
+        "Update_Payment",
+        request_obj.id,
+        actor=request_user,
+        details=f"status={new_status}",
+    )
+    _notify_users(
+        "update_payment_request_reviewed",
+        [_student_user(request_obj.student_id)],
+        f"Your update payment request has been {new_status}.",
+        actor_user=request_user,
+    )
+
     return request_obj
 
 
@@ -1384,6 +1863,9 @@ def create_mess_minutes(validated_data):
 
 def create_menu_change_request(data, *, request_user):
     """Create a menu change request from raw request data."""
+    allowed = COMMITTEE_OR_CONVENER_DESIGNATIONS.union(MANAGER_DESIGNATIONS)
+    _require_designation(request_user, allowed, allow_staff=True)
+
     dish_obj = get_object_or_404(Menu, dish=data["dish"])
     info = get_object_or_404(ExtraInfo, user=request_user)
     student = get_object_or_404(Student, id=info.id)
@@ -1464,11 +1946,14 @@ def process_excel_bill_update(file):
                 rebate_amount=rebate_amt,
                 total_bill=total_amt,
             )
+    _log_audit("bill_excel_processed", "Monthly_bill", details=f"file={getattr(file, 'name', 'uploaded')}")
 
 
 @transaction.atomic
 def admin_register_student(student_id_str, mess_option, amount, program, request_user):
     """Directly register a student to a mess (admin action, bypasses request flow)."""
+    _require_designation(request_user, MANAGER_DESIGNATIONS, allow_staff=True)
+
     from applications.academic_information.models import Student
     try:
         student = Student.objects.get(id__user__username=student_id_str.upper())
@@ -1492,12 +1977,21 @@ def admin_register_student(student_id_str, mess_option, amount, program, request
         reg_main.save(update_fields=["current_mess_status"])
 
     Reg_records.objects.create(student_id=student, start_date=date.today())
+    _log_audit(
+        "admin_registered_student",
+        "Reg_main",
+        reg_main.id,
+        actor=request_user,
+        details=f"student={student_id_str}, mess_option={mess_option}, amount={amount}",
+    )
     return reg_main
 
 
 @transaction.atomic
 def admin_deregister_student(student_id_str, request_user):
     """Directly deregister a student from mess (admin action)."""
+    _require_designation(request_user, MANAGER_DESIGNATIONS, allow_staff=True)
+
     from applications.academic_information.models import Student
     try:
         student = Student.objects.get(id__user__username=student_id_str.upper())
@@ -1517,12 +2011,21 @@ def admin_deregister_student(student_id_str, request_user):
     if reg_record:
         reg_record.end_date = date.today()
         reg_record.save(update_fields=["end_date"])
+    _log_audit(
+        "admin_deregistered_student",
+        "Reg_main",
+        reg_main.id,
+        actor=request_user,
+        details=f"student={student_id_str}",
+    )
     return reg_main
 
 
 @transaction.atomic
 def admin_deregister_all_from_mess(mess_option, request_user):
     """Deregister all students from a given mess (admin action)."""
+    _require_designation(request_user, MANAGER_DESIGNATIONS, allow_staff=True)
+
     students = Reg_main.objects.filter(mess_option=mess_option, current_mess_status="Registered")
     count = students.count()
     student_ids = list(students.values_list("student_id", flat=True))
@@ -1530,22 +2033,152 @@ def admin_deregister_all_from_mess(mess_option, request_user):
     Reg_records.objects.filter(
         student_id__in=student_ids, end_date__isnull=True
     ).update(end_date=date.today())
+    _log_audit(
+        "admin_deregistered_all_from_mess",
+        "Reg_main",
+        mess_option,
+        actor=request_user,
+        details=f"count={count}",
+    )
     return count
+
+
+def admin_bulk_register_students(file, default_mess_option, request_user):
+    """Bulk register students from Excel rows: Roll no, Balance, mess_option(optional)."""
+    _require_designation(request_user, MANAGER_DESIGNATIONS, allow_staff=True)
+
+    from openpyxl import load_workbook
+
+    if not getattr(file, "name", "").lower().endswith((".xlsx", ".xls")):
+        raise CentralMessServiceError(
+            "Invalid file format. Only .xlsx and .xls are allowed.",
+            status_code=400,
+        )
+
+    try:
+        workbook = load_workbook(file, data_only=True)
+    except Exception as exc:
+        raise CentralMessServiceError(
+            f"Unable to read Excel file: {exc}",
+            status_code=400,
+        )
+
+    sheet = workbook.active
+    default_mess = str(default_mess_option or "mess1").strip().lower()
+    if default_mess not in {"mess1", "mess2"}:
+        default_mess = "mess1"
+
+    success_count = 0
+    failed_count = 0
+    failures = []
+
+    for row_index, row in enumerate(sheet.iter_rows(min_row=2, values_only=True), start=2):
+        roll_cell = row[0] if len(row) > 0 else None
+        if roll_cell is None or str(roll_cell).strip() == "":
+            continue
+
+        student_id = str(roll_cell).strip().upper()
+        balance_cell = row[1] if len(row) > 1 else 0
+        mess_cell = row[2] if len(row) > 2 else None
+
+        try:
+            if balance_cell in (None, ""):
+                amount = 0
+            else:
+                amount = int(float(balance_cell))
+        except Exception:
+            failed_count += 1
+            failures.append(
+                {"row": row_index, "student_id": student_id, "reason": "Invalid balance value."}
+            )
+            continue
+
+        mess_option = str(mess_cell).strip().lower() if mess_cell not in (None, "") else default_mess
+        if mess_option not in {"mess1", "mess2"}:
+            failed_count += 1
+            failures.append(
+                {
+                    "row": row_index,
+                    "student_id": student_id,
+                    "reason": f"Invalid mess_option '{mess_option}'. Use mess1 or mess2.",
+                }
+            )
+            continue
+
+        try:
+            admin_register_student(student_id, mess_option, amount, "UG", request_user)
+            success_count += 1
+        except CentralMessServiceError as exc:
+            failed_count += 1
+            failures.append(
+                {"row": row_index, "student_id": student_id, "reason": str(exc)}
+            )
+        except Exception as exc:
+            failed_count += 1
+            failures.append(
+                {"row": row_index, "student_id": student_id, "reason": str(exc)}
+            )
+
+    _log_audit(
+        "admin_bulk_registered_students",
+        "Reg_main",
+        actor=request_user,
+        details=f"file={getattr(file, 'name', 'uploaded')}, success={success_count}, failed={failed_count}",
+    )
+
+    return {
+        "success_count": success_count,
+        "failed_count": failed_count,
+        "failures": failures[:50],
+    }
 
 
 def create_menu_poll(validated_data, *, request_user):
     from applications.globals.models import ExtraInfo
+
+    _require_designation(
+        request_user,
+        MANAGER_DESIGNATIONS.union(WARDEN_DESIGNATIONS),
+        allow_staff=True,
+    )
+
     payload = dict(validated_data)
     payload.pop("created_by", None)
+
+    today = date.today()
+    max_end_date = today + timedelta(days=2)
+    end_date = payload.get("end_date")
+    if end_date is None:
+        payload["end_date"] = max_end_date
+    elif end_date < today or end_date > max_end_date:
+        raise CentralMessServiceError(
+            f"Poll end_date must be between {today} and {max_end_date}.",
+            status_code=400,
+        )
+
     if request_user is not None:
         extra_info = ExtraInfo.objects.filter(user=request_user).first()
         if extra_info:
             payload["created_by"] = extra_info
-    return MenuPoll.objects.create(**payload)
+    poll = MenuPoll.objects.create(**payload)
+    _log_audit(
+        "menu_poll_created",
+        "MenuPoll",
+        poll.id,
+        actor=request_user,
+        details=f"end_date={poll.end_date}, mess_option={poll.mess_option}",
+    )
+    return poll
 
 
 def submit_poll_vote(poll_id, selected_option, *, request_user):
     poll = get_object_or_404(MenuPoll, pk=poll_id, is_active=True)
+
+    if poll.end_date and date.today() > poll.end_date:
+        poll.is_active = False
+        poll.save(update_fields=["is_active"])
+        raise CentralMessServiceError("This poll has already closed.", status_code=400)
+
     student = _get_student({}, request_user=request_user)
 
     # Validate option exists on poll
@@ -1553,30 +2186,93 @@ def submit_poll_vote(poll_id, selected_option, *, request_user):
     if not option_map.get(selected_option):
         raise CentralMessServiceError("Invalid option selected.", status_code=400)
 
-    vote, created = MenuPollVote.objects.update_or_create(
+    if MenuPollVote.objects.filter(poll=poll, student_id=student).exists():
+        raise CentralMessServiceError(
+            "You have already voted in this poll. Duplicate voting is not allowed.",
+            status_code=400,
+        )
+
+    voter_hash = hashlib.sha256(f"{poll.id}:{student.id}:{selected_option}".encode("utf-8")).hexdigest()
+    vote = MenuPollVote.objects.create(
         poll=poll,
         student_id=student,
-        defaults={"selected_option": selected_option},
+        selected_option=selected_option,
+        voter_hash=voter_hash,
+    )
+    _log_audit(
+        "menu_poll_voted",
+        "MenuPollVote",
+        vote.id,
+        actor=request_user,
+        details=f"poll_id={poll.id}",
     )
     return vote
 
 
 def close_menu_poll(poll_id, *, request_user):
+    _require_designation(
+        request_user,
+        MANAGER_DESIGNATIONS.union(WARDEN_DESIGNATIONS),
+        allow_staff=True,
+    )
+
     poll = get_object_or_404(MenuPoll, pk=poll_id)
     poll.is_active = False
     poll.save(update_fields=["is_active"])
+    _log_audit("menu_poll_closed", "MenuPoll", poll.id, actor=request_user)
     return poll
+
+
+def delete_menu_poll(poll_id, *, request_user):
+    _require_designation(
+        request_user,
+        MANAGER_DESIGNATIONS.union(WARDEN_DESIGNATIONS),
+        allow_staff=True,
+    )
+    poll = get_object_or_404(MenuPoll, pk=poll_id)
+    _log_audit("menu_poll_deleted", "MenuPoll", poll.id, actor=request_user)
+    poll.delete()
 
 
 def create_vacation_survey(validated_data, *, request_user):
     from applications.globals.models import ExtraInfo
+
+    _require_designation(
+        request_user,
+        MANAGER_DESIGNATIONS.union(WARDEN_DESIGNATIONS),
+        allow_staff=True,
+    )
+
     payload = dict(validated_data)
     payload.pop("created_by", None)
+
+    vacation_start = payload.get("vacation_start")
+    if vacation_start is not None:
+        days_before_start = (vacation_start - date.today()).days
+        if days_before_start < 7:
+            raise CentralMessServiceError(
+                "Vacation survey must be created at least 7 days before vacation start.",
+                status_code=400,
+            )
+
     if request_user is not None:
         extra_info = ExtraInfo.objects.filter(user=request_user).first()
         if extra_info:
             payload["created_by"] = extra_info
-    return VacationSurvey.objects.create(**payload)
+    survey = VacationSurvey.objects.create(**payload)
+    _log_audit(
+        "vacation_survey_created",
+        "VacationSurvey",
+        survey.id,
+        actor=request_user,
+    )
+    _notify_users(
+        "vacation_survey_created",
+        _get_users_by_designations({"student"}),
+        f"A new vacation survey '{survey.title}' has been published.",
+        actor_user=request_user,
+    )
+    return survey
 
 
 def submit_survey_response(survey_id, response, remarks, *, request_user):
@@ -1590,20 +2286,392 @@ def submit_survey_response(survey_id, response, remarks, *, request_user):
         student_id=student,
         defaults={"response": response, "remarks": remarks or ""},
     )
+    _log_audit(
+        "vacation_survey_responded",
+        "VacationSurveyResponse",
+        obj.id,
+        actor=request_user,
+        details=f"survey_id={survey_id}, response={response}",
+    )
     return obj
 
 
 def create_announcement(validated_data, *, request_user):
     from applications.globals.models import ExtraInfo
+
+    _require_designation(
+        request_user,
+        MANAGER_DESIGNATIONS.union(WARDEN_DESIGNATIONS),
+        allow_staff=True,
+    )
+
     payload = dict(validated_data)
     payload.pop("created_by", None)
+    expiry_date = payload.get("expiry_date")
+    if expiry_date is None:
+        payload["expiry_date"] = date.today() + timedelta(days=90)
+
     if request_user is not None:
         extra_info = ExtraInfo.objects.filter(user=request_user).first()
         if extra_info:
             payload["created_by"] = extra_info
-    return Announcement.objects.create(**payload)
+    announcement = Announcement.objects.create(**payload)
+    _log_audit(
+        "announcement_created",
+        "Announcement",
+        announcement.id,
+        actor=request_user,
+    )
+    return announcement
 
 
 def delete_announcement(announcement_id, *, request_user):
+    _require_designation(
+        request_user,
+        MANAGER_DESIGNATIONS.union(WARDEN_DESIGNATIONS),
+        allow_staff=True,
+    )
+
     announcement = get_object_or_404(Announcement, pk=announcement_id)
-    announcement.delete()
+    announcement.is_archived = True
+    announcement.save(update_fields=["is_archived"])
+    _log_audit(
+        "announcement_archived",
+        "Announcement",
+        announcement.id,
+        actor=request_user,
+    )
+
+
+def delete_vacation_survey(survey_id, *, request_user):
+    _require_designation(
+        request_user,
+        MANAGER_DESIGNATIONS.union(WARDEN_DESIGNATIONS),
+        allow_staff=True,
+    )
+    survey = get_object_or_404(VacationSurvey, pk=survey_id)
+    _log_audit(
+        "vacation_survey_deleted",
+        "VacationSurvey",
+        survey.id,
+        actor=request_user,
+    )
+    survey.delete()
+
+
+def enforce_read_access(request_user, endpoint, method, allowed_designations, *, allow_staff=False):
+    allowed = {str(item).strip().lower() for item in allowed_designations}
+    user_designations = _designation_names_for_user(request_user)
+    if user_designations.intersection(allowed):
+        return
+    if allow_staff and getattr(request_user, "is_staff", False):
+        return
+    _log_access_violation(
+        request_user,
+        endpoint=endpoint,
+        method=method,
+        reason=f"Required one of roles: {sorted(allowed)}",
+    )
+    raise CentralMessServiceError("You are not authorized to view this resource.", status_code=403)
+
+
+def auto_close_expired_polls():
+    closed = MenuPoll.objects.filter(is_active=True, end_date__lt=date.today()).update(is_active=False)
+    if closed:
+        _log_audit("menu_polls_auto_closed", "MenuPoll", details=f"count={closed}")
+    return closed
+
+
+def escalate_stale_rebates():
+    cutoff = datetime.now() - timedelta(hours=24)
+    stale = Rebate.objects.filter(
+        status="1",
+        is_escalated=False,
+        app_date__lt=cutoff.date(),
+    )
+    updated_ids = list(stale.values_list("id", flat=True))
+    if not updated_ids:
+        return 0
+    Rebate.objects.filter(id__in=updated_ids).update(
+        is_escalated=True,
+        escalated_at=datetime.now(),
+    )
+    wardens = _get_users_by_designations(WARDEN_DESIGNATIONS)
+    _notify_users(
+        "rebate_escalation",
+        wardens,
+        f"{len(updated_ids)} rebate requests breached SLA and were escalated.",
+    )
+    _log_audit("rebate_sla_escalated", "Rebate", details=f"ids={updated_ids}")
+    return len(updated_ids)
+
+
+def apply_monthly_bill_policies():
+    today = date.today()
+    processed = 0
+    bills = Monthly_bill.objects.filter(paid=False)
+    for bill in bills:
+        changed_fields = []
+        if not bill.generated_on:
+            bill.generated_on = today
+            changed_fields.append("generated_on")
+        if not bill.due_date:
+            bill.due_date = (bill.generated_on or today) + timedelta(days=PAYMENT_GRACE_DAYS)
+            changed_fields.append("due_date")
+        if bill.due_date and today > bill.due_date and bill.late_fee == 0:
+            bill.late_fee = DEFAULT_LATE_FEE
+            bill.total_bill = (bill.total_bill or 0) + DEFAULT_LATE_FEE
+            changed_fields.extend(["late_fee", "total_bill"])
+        if bill.due_date and today > bill.due_date + timedelta(days=PAYMENT_ESCALATION_DAYS):
+            if not bill.escalated_for_nonpayment:
+                bill.escalated_for_nonpayment = True
+                changed_fields.append("escalated_for_nonpayment")
+        if changed_fields:
+            bill.save(update_fields=list(set(changed_fields)))
+            processed += 1
+    if processed:
+        _log_audit("monthly_bill_policy_applied", "Monthly_bill", details=f"updated={processed}")
+    return processed
+
+
+def create_feedback_report_snapshot(*, request_user=None):
+    week_end = date.today()
+    week_start = week_end - timedelta(days=6)
+    feedback_qs = Feedback.objects.filter(fdate__gte=week_start, fdate__lte=week_end)
+    report_payload = {
+        "week_start": str(week_start),
+        "week_end": str(week_end),
+        "total_feedback": feedback_qs.count(),
+        "food": feedback_qs.filter(feedback_type="food").count(),
+        "cleanliness": feedback_qs.filter(feedback_type="cleanliness").count(),
+        "maintenance": feedback_qs.filter(feedback_type="maintenance").count(),
+        "others": feedback_qs.filter(feedback_type="others").count(),
+    }
+    generator = None
+    if request_user is not None:
+        generator = ExtraInfo.objects.filter(user=request_user).first()
+    report = FeedbackReport.objects.create(
+        week_start=week_start,
+        week_end=week_end,
+        generated_by=generator,
+        report_snapshot=json.dumps(report_payload),
+    )
+    wardens = _get_users_by_designations(WARDEN_DESIGNATIONS)
+    _notify_users(
+        "weekly_feedback_report",
+        wardens,
+        f"Weekly feedback report generated for {week_start} to {week_end}.",
+        actor_user=request_user,
+    )
+    _log_audit("feedback_report_generated", "FeedbackReport", report.id, actor=request_user)
+    return report
+
+
+@transaction.atomic
+def create_refund_request(validated_data, *, request_user):
+    payload = dict(validated_data)
+    payload["student_id"] = _get_student(payload, request_user=request_user)
+    payload.setdefault("status", "pending")
+    refund = RefundRequest.objects.create(**payload)
+    _log_audit("refund_request_created", "RefundRequest", refund.id, actor=request_user)
+    reviewer_users = _get_users_by_designations(WARDEN_DESIGNATIONS.union(MANAGER_DESIGNATIONS))
+    _notify_users(
+        "refund_request_created",
+        reviewer_users,
+        f"New refund request submitted by {refund.student_id}.",
+        actor_user=request_user,
+    )
+    return refund
+
+
+@transaction.atomic
+def decide_refund_request(refund_id, status_value, reviewer_remark, reference_no, *, request_user):
+    _require_designation(
+        request_user,
+        MANAGER_DESIGNATIONS.union(WARDEN_DESIGNATIONS).union(ADMIN_DESIGNATIONS),
+        allow_staff=True,
+    )
+    refund = get_object_or_404(RefundRequest, pk=refund_id)
+    if refund.status != "pending":
+        raise CentralMessServiceError("Refund request is already processed.", status_code=400)
+    status_norm = str(status_value).strip().lower()
+    if status_norm not in {"approved", "rejected"}:
+        raise CentralMessServiceError("status must be approved or rejected.", status_code=400)
+    if status_norm == "approved":
+        if not refund.finance_cleared:
+            raise CentralMessServiceError(
+                "Refund cannot be approved before finance clearance.",
+                status_code=400,
+            )
+        reg_main = Reg_main.objects.filter(student_id=refund.student_id).first()
+        if reg_main and reg_main.balance < 0:
+            raise CentralMessServiceError(
+                "Refund cannot be approved while pending dues exist.",
+                status_code=400,
+            )
+
+    reviewer = ExtraInfo.objects.filter(user=request_user).first()
+    refund.status = status_norm
+    refund.reviewer = reviewer
+    refund.reviewer_remark = reviewer_remark or ""
+    refund.reviewed_at = datetime.now()
+    refund.save(
+        update_fields=["status", "reviewer", "reviewer_remark", "reviewed_at"]
+    )
+
+    if status_norm == "approved":
+        RefundLedger.objects.update_or_create(
+            refund_request=refund,
+            defaults={
+                "amount": refund.amount,
+                "reference_no": reference_no or "",
+                "processed_by": reviewer,
+            },
+        )
+
+    _log_audit(
+        "refund_request_reviewed",
+        "RefundRequest",
+        refund.id,
+        actor=request_user,
+        details=f"status={status_norm}",
+    )
+    _notify_users(
+        "refund_request_reviewed",
+        [_student_user(refund.student_id)],
+        f"Your refund request has been {status_norm}.",
+        actor_user=request_user,
+    )
+    return refund
+
+
+@transaction.atomic
+def cancel_refund_request(refund_id, *, request_user):
+    refund = get_object_or_404(RefundRequest, pk=refund_id)
+    student = get_student_from_request_user(request_user)
+    if refund.student_id != student:
+        raise CentralMessServiceError("You can cancel only your own refund request.", status_code=403)
+    if refund.status != "pending":
+        raise CentralMessServiceError("Only pending refund request can be cancelled.", status_code=400)
+    refund.status = "cancelled"
+    refund.save(update_fields=["status"])
+    _log_audit("refund_request_cancelled", "RefundRequest", refund.id, actor=request_user)
+    return refund
+
+
+def create_special_event_meal(validated_data, *, request_user):
+    _require_designation(
+        request_user,
+        MANAGER_DESIGNATIONS.union(WARDEN_DESIGNATIONS),
+        allow_staff=True,
+    )
+    payload = dict(validated_data)
+    payload.pop("created_by", None)
+    payload.setdefault("is_active", True)
+    creator = ExtraInfo.objects.filter(user=request_user).first()
+    if creator:
+        payload["created_by"] = creator
+    if not payload.get("budget_approved", False):
+        raise CentralMessServiceError("Budget must be approved before publishing special event meal.", status_code=400)
+    meal = SpecialEventMeal.objects.create(**payload)
+    _log_audit("special_event_meal_created", "SpecialEventMeal", meal.id, actor=request_user)
+    _notify_users(
+        "special_event_meal_created",
+        _get_users_by_designations({"student"}),
+        f"Special event meal '{meal.title}' is now published for {meal.event_date}.",
+        actor_user=request_user,
+    )
+    return meal
+
+
+def delete_special_event_meal(event_id, *, request_user):
+    _require_designation(
+        request_user,
+        MANAGER_DESIGNATIONS.union(WARDEN_DESIGNATIONS),
+        allow_staff=True,
+    )
+    meal = get_object_or_404(SpecialEventMeal, pk=event_id)
+    meal.is_active = False
+    meal.save(update_fields=["is_active"])
+    _log_audit("special_event_meal_deactivated", "SpecialEventMeal", meal.id, actor=request_user)
+    return meal
+
+
+@transaction.atomic
+def assign_mess_role(role_type, assignee_username, start_date_value=None, end_date_value=None, reason="", *, request_user):
+    _require_designation(
+        request_user,
+        ADMIN_DESIGNATIONS.union(WARDEN_DESIGNATIONS),
+        allow_staff=True,
+    )
+    role_norm = str(role_type).strip().lower()
+    if role_norm not in {"caretaker", "warden"}:
+        raise CentralMessServiceError("role_type must be caretaker or warden.", status_code=400)
+
+    try:
+        assignee = User.objects.get(username=assignee_username)
+    except User.DoesNotExist:
+        raise CentralMessServiceError("Assignee user not found.", status_code=404)
+
+    current_active = RoleAssignment.objects.filter(role_type=role_norm, is_active=True).order_by("-created_at").first()
+    previous_user = current_active.assignee if current_active else None
+
+    if current_active:
+        current_active.is_active = False
+        current_active.end_date = start_date_value or date.today()
+        current_active.save(update_fields=["is_active", "end_date"])
+
+    designation_name = "mess_manager" if role_norm == "caretaker" else "mess_warden"
+    designation = Designation.objects.filter(name=designation_name).first()
+    if designation is None:
+        designation = Designation.objects.create(name=designation_name)
+
+    HoldsDesignation.objects.filter(designation=designation).exclude(user=assignee).delete()
+    HoldsDesignation.objects.get_or_create(
+        user=assignee,
+        working=assignee,
+        designation=designation,
+    )
+
+    assignment = RoleAssignment.objects.create(
+        role_type=role_norm,
+        assignee=assignee,
+        assigned_by=request_user,
+        start_date=start_date_value or date.today(),
+        end_date=end_date_value,
+        reason=reason or "",
+        is_active=True,
+    )
+
+    pending_count = 0
+    pending_count += Registration_Request.objects.filter(status__iexact="pending").count()
+    pending_count += Deregistration_Request.objects.filter(status__iexact="pending").count()
+    pending_count += Rebate.objects.filter(status="1").count()
+    pending_count += Special_request.objects.filter(status="1").count()
+    pending_count += Update_Payment.objects.filter(status__iexact="pending").count()
+    pending_count += RefundRequest.objects.filter(status="pending").count()
+
+    RoleTransferLog.objects.create(
+        role_type=role_norm,
+        previous_assignee=previous_user,
+        new_assignee=assignee,
+        transferred_pending_count=pending_count,
+    )
+
+    _log_audit(
+        "mess_role_assigned",
+        "RoleAssignment",
+        assignment.id,
+        actor=request_user,
+        details=f"role={role_norm}, assignee={assignee.username}, pending_transferred={pending_count}",
+    )
+    recipients = [assignee]
+    if previous_user and previous_user != assignee:
+        recipients.append(previous_user)
+    _notify_users(
+        "mess_role_assigned",
+        recipients,
+        f"{role_norm.title()} role has been reassigned to {assignee.username}.",
+        actor_user=request_user,
+    )
+    return assignment

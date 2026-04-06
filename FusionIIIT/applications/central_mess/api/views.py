@@ -4,9 +4,17 @@ from rest_framework.response import Response
 from rest_framework.views import APIView
 
 from applications.central_mess.selectors import (
+    get_access_violation_queryset,
     get_announcement_queryset,
+    get_audit_log_queryset,
     get_deregistration_request_queryset,
+    get_feedback_report_queryset,
     get_poll_queryset,
+    get_refund_ledger_queryset,
+    get_refund_request_queryset,
+    get_role_assignment_queryset,
+    get_role_transfer_log_queryset,
+    get_special_event_meal_queryset,
     get_vacation_survey_queryset,
     get_feedback_queryset,
     get_menu_change_request_queryset,
@@ -26,16 +34,26 @@ from applications.central_mess.selectors import (
     get_registration_request_queryset,
     get_special_request_queryset,
     get_student_from_request_user,
+    get_user_designation_names,
     get_update_payment_request_queryset,
     get_vacation_food_queryset,
 )
 from applications.central_mess.services import (
+    apply_monthly_bill_policies,
+    assign_mess_role,
+    auto_close_expired_polls,
+    cancel_refund_request,
     CentralMessServiceError,
+    create_feedback_report_snapshot,
+    create_refund_request,
+    create_special_event_meal,
     RebateOverlapError,
     admin_deregister_all_from_mess,
+    admin_bulk_register_students,
     admin_deregister_student,
     admin_register_student,
     close_menu_poll,
+    delete_menu_poll,
     create_announcement,
     create_menu_poll,
     create_vacation_survey,
@@ -58,10 +76,15 @@ from applications.central_mess.services import (
     create_vacation_food,
     delete_deregistration_request,
     decide_deregistration_request,
+    decide_refund_request,
     decide_registration_request,
     decide_update_payment_request,
     delete_announcement,
+    delete_special_event_meal,
+    delete_vacation_survey,
     delete_feedback,
+    enforce_read_access,
+    escalate_stale_rebates,
     process_excel_bill_update,
     update_feedback_status,
     update_menu_items,
@@ -71,9 +94,20 @@ from applications.central_mess.services import (
 )
 
 from .serializers import (
+    AccessViolationLogSerializer,
     AnnouncementSerializer,
+    AuditLogSerializer,
+    FeedbackReportSerializer,
     MenuPollSerializer,
     MenuPollVoteSerializer,
+    RefundCancelSerializer,
+    RefundDecisionSerializer,
+    RefundLedgerSerializer,
+    RefundRequestSerializer,
+    RoleAssignmentActionSerializer,
+    RoleAssignmentSerializer,
+    RoleTransferLogSerializer,
+    SpecialEventMealSerializer,
     VacationSurveySerializer,
     VacationSurveyResponseSerializer,
     DeregistrationDecisionSerializer,
@@ -104,11 +138,22 @@ from .serializers import (
     reg_recordSerialzer,
 )
 
+MANAGEMENT_READ_ROLES = {"mess_manager", "mess_warden", "mess_admin"}
+
+
+def _designation_set(user):
+    return {str(name).strip().lower() for name in get_user_designation_names(user)}
+
 
 class FeedbackApi(APIView):
 
     def get(self, request):
-        feedback_obj = get_feedback_queryset()
+        roles = _designation_set(request.user)
+        if roles.intersection(MANAGEMENT_READ_ROLES):
+            feedback_obj = get_feedback_queryset()
+        else:
+            student = get_student_from_request_user(request.user)
+            feedback_obj = get_feedback_queryset(student=student)
         serialized_obj = FeedbackSerializer(feedback_obj, many=True)
         return Response({'status': 200, 'payload': serialized_obj.data})
 
@@ -182,7 +227,13 @@ class MessBillBaseApi(APIView):
 class Monthly_billApi(APIView):
 
     def get(self, request):
-        monthly_bill_obj = get_monthly_bill_queryset()
+        apply_monthly_bill_policies()
+        roles = _designation_set(request.user)
+        if roles.intersection(MANAGEMENT_READ_ROLES):
+            monthly_bill_obj = get_monthly_bill_queryset()
+        else:
+            student = get_student_from_request_user(request.user)
+            monthly_bill_obj = get_monthly_bill_queryset(student=student)
         serialized_obj = Monthly_billSerializer(monthly_bill_obj, many=True)
         return Response({'status': 200, 'payload': serialized_obj.data})
 
@@ -222,14 +273,23 @@ class MenuApi(APIView):
         items = request.data.get('items', [])
         if not mess_option or not items:
             return Response({'error': 'mess_option and items are required'}, status=400)
-        update_menu_items(mess_option, items)
+        try:
+            update_menu_items(mess_option, items, request_user=request.user)
+        except CentralMessServiceError as exc:
+            return Response({'error': str(exc)}, status=exc.status_code)
         return Response({'status': 200})
 
 
 class RebateApi(APIView):
 
     def get(self, request):
-        rebate_obj = get_rebate_queryset()
+        escalate_stale_rebates()
+        roles = _designation_set(request.user)
+        if roles.intersection(MANAGEMENT_READ_ROLES):
+            rebate_obj = get_rebate_queryset()
+        else:
+            student = get_student_from_request_user(request.user)
+            rebate_obj = get_rebate_queryset(student=student)
         serialized_obj = RebateSerializer(rebate_obj, many=True)
         return Response({'status': 200, 'payload': serialized_obj.data})
 
@@ -246,7 +306,10 @@ class RebateApi(APIView):
     def put(self, request):
         serializer = RebateStatusUpdateSerializer(data=request.data)
         if serializer.is_valid():
-            update_rebate_status(serializer.validated_data)
+            try:
+                update_rebate_status(serializer.validated_data, request_user=request.user)
+            except CentralMessServiceError as exc:
+                return Response({'error': str(exc)}, status=exc.status_code)
             return Response({'status': 200})
         return Response(serializer.errors, status=400)
 
@@ -254,7 +317,12 @@ class RebateApi(APIView):
 class Vacation_foodApi(APIView):
 
     def get(self, request):
-        vacation_food_obj = get_vacation_food_queryset()
+        roles = _designation_set(request.user)
+        if roles.intersection(MANAGEMENT_READ_ROLES):
+            vacation_food_obj = get_vacation_food_queryset()
+        else:
+            student = get_student_from_request_user(request.user)
+            vacation_food_obj = get_vacation_food_queryset(student=student)
         serialized_obj = Vacation_foodSerializer(vacation_food_obj, many=True)
         return Response({'status': 200, 'payload': serialized_obj.data})
 
@@ -279,7 +347,12 @@ class Vacation_foodApi(APIView):
 class Special_requestApi(APIView):
 
     def get(self, request):
-        special_request_obj = get_special_request_queryset()
+        roles = _designation_set(request.user)
+        if roles.intersection(MANAGEMENT_READ_ROLES):
+            special_request_obj = get_special_request_queryset()
+        else:
+            student = get_student_from_request_user(request.user)
+            special_request_obj = get_special_request_queryset(student=student)
         serialized_obj = Special_requestSerializer(special_request_obj, many=True)
         return Response({'status': 200, 'payload': serialized_obj.data})
 
@@ -293,7 +366,10 @@ class Special_requestApi(APIView):
     def put(self, request):
         serializer = SpecialRequestStatusUpdateSerializer(data=request.data)
         if serializer.is_valid():
-            update_special_request_status(serializer.validated_data)
+            try:
+                update_special_request_status(serializer.validated_data, request_user=request.user)
+            except CentralMessServiceError as exc:
+                return Response({'error': str(exc)}, status=exc.status_code)
             return Response({'status': 200})
         return Response(serializer.errors, status=400)
 
@@ -339,6 +415,8 @@ class Menu_change_requestApi(APIView):
         try:
             create_menu_change_request(request.data, request_user=request.user)
             return Response({'status': 200})
+        except CentralMessServiceError as exc:
+            return Response({'error': str(exc)}, status=exc.status_code)
         except Exception as exc:
             return Response({'error': str(exc)}, status=400)
 
@@ -346,6 +424,13 @@ class Menu_change_requestApi(APIView):
 class Get_Filtered_Students(APIView):
 
     def post(self, request):
+        enforce_read_access(
+            request.user,
+            endpoint="/mess/api/get_mess_students/",
+            method="POST",
+            allowed_designations=MANAGEMENT_READ_ROLES,
+            allow_staff=True,
+        )
         req_type = request.data.get('type')
 
         if req_type == 'filter':
@@ -372,6 +457,13 @@ class Get_Filtered_Students(APIView):
 class Get_Reg_Records(APIView):
 
     def get(self, request):
+        enforce_read_access(
+            request.user,
+            endpoint="/mess/api/get_reg_records/",
+            method="GET",
+            allowed_designations=MANAGEMENT_READ_ROLES,
+            allow_staff=True,
+        )
         student_id = request.GET.get('student_id')
         reg_record = get_reg_records_queryset(student=student_id)
         serialized_obj = reg_recordSerialzer(reg_record, many=True)
@@ -381,6 +473,14 @@ class Get_Reg_Records(APIView):
 class Get_Student_bill(APIView):
 
     def post(self, request):
+        apply_monthly_bill_policies()
+        enforce_read_access(
+            request.user,
+            endpoint="/mess/api/get_student_bill/",
+            method="POST",
+            allowed_designations=MANAGEMENT_READ_ROLES,
+            allow_staff=True,
+        )
         student = request.data.get('student_id')
         bill_details = get_monthly_bill_queryset(student=student)
         serialized_obj = Monthly_billSerializer(bill_details, many=True)
@@ -390,6 +490,13 @@ class Get_Student_bill(APIView):
 class Get_Student_Payments(APIView):
 
     def post(self, request):
+        enforce_read_access(
+            request.user,
+            endpoint="/mess/api/get_student_payment/",
+            method="POST",
+            allowed_designations=MANAGEMENT_READ_ROLES,
+            allow_staff=True,
+        )
         student = request.data.get('student_id')
         payment_details = get_payments_queryset(student=student)
         serialized_obj = PaymentsSerializer(payment_details, many=True)
@@ -399,6 +506,13 @@ class Get_Student_Payments(APIView):
 class Get_Student_Details(APIView):
 
     def post(self, request):
+        enforce_read_access(
+            request.user,
+            endpoint="/mess/api/get_student_all_details/",
+            method="POST",
+            allowed_designations=MANAGEMENT_READ_ROLES,
+            allow_staff=True,
+        )
         student = request.data.get('student_id')
         try:
             reg_main = get_reg_main_by_student_id(student)
@@ -423,7 +537,12 @@ class Get_Student_Details(APIView):
 class RegistrationRequestApi(APIView):
 
     def get(self, request):
-        registration_requests = get_registration_request_queryset()
+        roles = _designation_set(request.user)
+        if roles.intersection(MANAGEMENT_READ_ROLES):
+            registration_requests = get_registration_request_queryset()
+        else:
+            student = get_student_from_request_user(request.user)
+            registration_requests = get_registration_request_queryset(student=student)
         serializer = RegistrationRequestSerializer(registration_requests, many=True)
         return Response({'status': 200, 'payload': serializer.data})
 
@@ -444,7 +563,10 @@ class RegistrationRequestApi(APIView):
     def put(self, request):
         serializer = RegistrationDecisionSerializer(data=request.data)
         if serializer.is_valid():
-            decide_registration_request(serializer.validated_data)
+            try:
+                decide_registration_request(serializer.validated_data, request_user=request.user)
+            except CentralMessServiceError as exc:
+                return Response({'error': str(exc)}, status=exc.status_code)
             return Response({'status': 200})
         return Response(serializer.errors, status=400)
 
@@ -452,7 +574,12 @@ class RegistrationRequestApi(APIView):
 class DeregistrationRequestApi(APIView):
 
     def get(self, request):
-        deregistration_requests = get_deregistration_request_queryset()
+        roles = _designation_set(request.user)
+        if roles.intersection(MANAGEMENT_READ_ROLES):
+            deregistration_requests = get_deregistration_request_queryset()
+        else:
+            student = get_student_from_request_user(request.user)
+            deregistration_requests = get_deregistration_request_queryset(student=student)
         serializer = DeregistrationRequestSerializer(deregistration_requests, many=True)
         return Response({'status': 200, 'payload': serializer.data})
 
@@ -474,7 +601,7 @@ class DeregistrationRequestApi(APIView):
         serializer = DeregistrationDecisionSerializer(data=request.data)
         if serializer.is_valid():
             try:
-                decide_deregistration_request(serializer.validated_data)
+                decide_deregistration_request(serializer.validated_data, request_user=request.user)
                 return Response({'status': 200})
             except CentralMessServiceError as exc:
                 return Response({'error': str(exc)}, status=exc.status_code)
@@ -502,7 +629,12 @@ class UpdatePaymentRequestApi(APIView):
 
     def get(self, request):
         student_id = request.query_params.get('student_id')
-        update_payment_requests = get_update_payment_request_queryset(student=student_id)
+        roles = _designation_set(request.user)
+        if roles.intersection(MANAGEMENT_READ_ROLES):
+            update_payment_requests = get_update_payment_request_queryset(student=student_id)
+        else:
+            student = get_student_from_request_user(request.user)
+            update_payment_requests = get_update_payment_request_queryset(student=student)
         serializer = UpdatePaymentRequestSerializer(update_payment_requests, many=True)
         return Response({'status': 200, 'payload': serializer.data})
 
@@ -518,7 +650,10 @@ class UpdatePaymentRequestApi(APIView):
     def put(self, request):
         serializer = UpdatePaymentDecisionSerializer(data=request.data)
         if serializer.is_valid():
-            decide_update_payment_request(serializer.validated_data)
+            try:
+                decide_update_payment_request(serializer.validated_data, request_user=request.user)
+            except CentralMessServiceError as exc:
+                return Response({'error': str(exc)}, status=exc.status_code)
             return Response({'status': 200})
         return Response(serializer.errors, status=400)
 
@@ -527,6 +662,13 @@ class UpdateBillExcelAPI(APIView):
     parser_classes = (MultiPartParser, FormParser)
 
     def post(self, request):
+        enforce_read_access(
+            request.user,
+            endpoint="/mess/api/updateBillExcelApi/",
+            method="POST",
+            allowed_designations=MANAGEMENT_READ_ROLES,
+            allow_staff=True,
+        )
         if 'file' not in request.FILES:
             return Response(
                 {'error': 'No file provided'}, status=status.HTTP_400_BAD_REQUEST
@@ -581,6 +723,7 @@ class MenuPollApi(APIView):
     """
 
     def get(self, request):
+        auto_close_expired_polls()
         mess_option = request.query_params.get("mess_option")
         active_only = request.query_params.get("active_only", "").lower() == "true"
         polls = get_poll_queryset(mess_option=mess_option, active_only=active_only)
@@ -628,11 +771,11 @@ class MenuPollApi(APIView):
         poll_id = request.data.get("poll_id")
         if not poll_id:
             return Response({"error": "poll_id is required."}, status=400)
-        from django.shortcuts import get_object_or_404
-        from applications.central_mess.models import MenuPoll
-        poll = get_object_or_404(MenuPoll, pk=poll_id)
-        poll.delete()
-        return Response({"status": 200})
+        try:
+            delete_menu_poll(poll_id, request_user=request.user)
+            return Response({"status": 200})
+        except CentralMessServiceError as exc:
+            return Response({"error": str(exc)}, status=exc.status_code)
 
 
 class AdminMessManagementApi(APIView):
@@ -673,7 +816,22 @@ class AdminMessManagementApi(APIView):
             count = admin_deregister_all_from_mess(mess_option, request.user)
             return Response({"status": 200, "message": f"Deregistered {count} students from {mess_option}."})
 
-        return Response({"error": "Invalid action. Must be add, remove, or remove_all."}, status=400)
+        elif action == "bulk_add":
+            upload = request.FILES.get("file")
+            if upload is None:
+                return Response({"error": "file is required for bulk_add action."}, status=400)
+            mess_option = request.data.get("mess_option", "mess1")
+            try:
+                result = admin_bulk_register_students(upload, mess_option, request.user)
+            except CentralMessServiceError as exc:
+                return Response({"error": str(exc)}, status=exc.status_code)
+            message = (
+                f"Bulk registration completed. Success: {result['success_count']}, "
+                f"Failed: {result['failed_count']}."
+            )
+            return Response({"status": 200, "message": message, "payload": result})
+
+        return Response({"error": "Invalid action. Must be add, remove, remove_all, or bulk_add."}, status=400)
 
 
 class AnnouncementApi(APIView):
@@ -754,8 +912,203 @@ class VacationSurveyApi(APIView):
         survey_id = request.data.get("survey_id")
         if not survey_id:
             return Response({"error": "survey_id is required."}, status=400)
-        from django.shortcuts import get_object_or_404
-        from applications.central_mess.models import VacationSurvey
-        survey = get_object_or_404(VacationSurvey, pk=survey_id)
-        survey.delete()
-        return Response({"status": 200})
+        try:
+            delete_vacation_survey(survey_id, request_user=request.user)
+            return Response({"status": 200})
+        except CentralMessServiceError as exc:
+            return Response({"error": str(exc)}, status=exc.status_code)
+
+
+class RefundRequestApi(APIView):
+
+    def get(self, request):
+        roles = _designation_set(request.user)
+        if roles.intersection(MANAGEMENT_READ_ROLES):
+            refund_qs = get_refund_request_queryset()
+        else:
+            student = get_student_from_request_user(request.user)
+            refund_qs = get_refund_request_queryset(student=student)
+        serializer = RefundRequestSerializer(refund_qs, many=True)
+        return Response({"status": 200, "payload": serializer.data})
+
+    def post(self, request):
+        serializer = RefundRequestSerializer(data=request.data)
+        if serializer.is_valid():
+            try:
+                obj = create_refund_request(serializer.validated_data, request_user=request.user)
+                return Response(
+                    {"status": 200, "payload": RefundRequestSerializer(obj).data},
+                    status=status.HTTP_201_CREATED,
+                )
+            except CentralMessServiceError as exc:
+                return Response({"error": str(exc)}, status=exc.status_code)
+        return Response(serializer.errors, status=400)
+
+    def put(self, request):
+        serializer = RefundDecisionSerializer(data=request.data)
+        if serializer.is_valid():
+            try:
+                obj = decide_refund_request(
+                    serializer.validated_data["id"],
+                    serializer.validated_data["status"],
+                    serializer.validated_data.get("reviewer_remark", ""),
+                    serializer.validated_data.get("reference_no", ""),
+                    request_user=request.user,
+                )
+                return Response({"status": 200, "payload": RefundRequestSerializer(obj).data})
+            except CentralMessServiceError as exc:
+                return Response({"error": str(exc)}, status=exc.status_code)
+        return Response(serializer.errors, status=400)
+
+    def delete(self, request):
+        serializer = RefundCancelSerializer(data=request.data)
+        if serializer.is_valid():
+            try:
+                obj = cancel_refund_request(serializer.validated_data["id"], request_user=request.user)
+                return Response({"status": 200, "payload": RefundRequestSerializer(obj).data})
+            except CentralMessServiceError as exc:
+                return Response({"error": str(exc)}, status=exc.status_code)
+        return Response(serializer.errors, status=400)
+
+
+class RefundLedgerApi(APIView):
+
+    def get(self, request):
+        roles = _designation_set(request.user)
+        if roles.intersection(MANAGEMENT_READ_ROLES):
+            ledger_qs = get_refund_ledger_queryset()
+        else:
+            student = get_student_from_request_user(request.user)
+            ledger_qs = get_refund_ledger_queryset(student=student)
+        serializer = RefundLedgerSerializer(ledger_qs, many=True)
+        return Response({"status": 200, "payload": serializer.data})
+
+
+class SpecialEventMealApi(APIView):
+
+    def get(self, request):
+        mess_option = request.query_params.get("mess_option")
+        active_only = request.query_params.get("active_only", "").lower() == "true"
+        qs = get_special_event_meal_queryset(mess_option=mess_option, active_only=active_only)
+        serializer = SpecialEventMealSerializer(qs, many=True)
+        return Response({"status": 200, "payload": serializer.data})
+
+    def post(self, request):
+        serializer = SpecialEventMealSerializer(data=request.data)
+        if serializer.is_valid():
+            try:
+                obj = create_special_event_meal(serializer.validated_data, request_user=request.user)
+                return Response(
+                    {"status": 200, "payload": SpecialEventMealSerializer(obj).data},
+                    status=status.HTTP_201_CREATED,
+                )
+            except CentralMessServiceError as exc:
+                return Response({"error": str(exc)}, status=exc.status_code)
+        return Response(serializer.errors, status=400)
+
+    def delete(self, request):
+        event_id = request.data.get("id")
+        if not event_id:
+            return Response({"error": "id is required."}, status=400)
+        try:
+            obj = delete_special_event_meal(event_id, request_user=request.user)
+            return Response({"status": 200, "payload": SpecialEventMealSerializer(obj).data})
+        except CentralMessServiceError as exc:
+            return Response({"error": str(exc)}, status=exc.status_code)
+
+
+class RoleAssignmentApi(APIView):
+
+    def get(self, request):
+        enforce_read_access(
+            request.user,
+            endpoint="/mess/api/roleAssignmentApi/",
+            method="GET",
+            allowed_designations=MANAGEMENT_READ_ROLES,
+            allow_staff=True,
+        )
+        role_type = request.query_params.get("role_type")
+        active_only = request.query_params.get("active_only", "").lower() == "true"
+        assignments = get_role_assignment_queryset(role_type=role_type, active_only=active_only)
+        transfers = get_role_transfer_log_queryset(role_type=role_type)
+        return Response(
+            {
+                "status": 200,
+                "payload": {
+                    "assignments": RoleAssignmentSerializer(assignments, many=True).data,
+                    "transfers": RoleTransferLogSerializer(transfers, many=True).data,
+                },
+            }
+        )
+
+    def post(self, request):
+        serializer = RoleAssignmentActionSerializer(data=request.data)
+        if serializer.is_valid():
+            try:
+                obj = assign_mess_role(
+                    serializer.validated_data["role_type"],
+                    serializer.validated_data["assignee_username"],
+                    serializer.validated_data.get("start_date"),
+                    serializer.validated_data.get("end_date"),
+                    serializer.validated_data.get("reason", ""),
+                    request_user=request.user,
+                )
+                return Response(
+                    {"status": 200, "payload": RoleAssignmentSerializer(obj).data},
+                    status=status.HTTP_201_CREATED,
+                )
+            except CentralMessServiceError as exc:
+                return Response({"error": str(exc)}, status=exc.status_code)
+        return Response(serializer.errors, status=400)
+
+
+class AuditAndComplianceApi(APIView):
+
+    def get(self, request):
+        enforce_read_access(
+            request.user,
+            endpoint="/mess/api/auditComplianceApi/",
+            method="GET",
+            allowed_designations=MANAGEMENT_READ_ROLES,
+            allow_staff=True,
+        )
+        return Response(
+            {
+                "status": 200,
+                "payload": {
+                    "audit_logs": AuditLogSerializer(get_audit_log_queryset()[:200], many=True).data,
+                    "access_violations": AccessViolationLogSerializer(
+                        get_access_violation_queryset()[:200], many=True
+                    ).data,
+                },
+            }
+        )
+
+
+class FeedbackReportApi(APIView):
+
+    def get(self, request):
+        enforce_read_access(
+            request.user,
+            endpoint="/mess/api/feedbackReportApi/",
+            method="GET",
+            allowed_designations=MANAGEMENT_READ_ROLES,
+            allow_staff=True,
+        )
+        reports = get_feedback_report_queryset()
+        serializer = FeedbackReportSerializer(reports, many=True)
+        return Response({"status": 200, "payload": serializer.data})
+
+    def post(self, request):
+        enforce_read_access(
+            request.user,
+            endpoint="/mess/api/feedbackReportApi/",
+            method="POST",
+            allowed_designations=MANAGEMENT_READ_ROLES,
+            allow_staff=True,
+        )
+        report = create_feedback_report_snapshot(request_user=request.user)
+        return Response(
+            {"status": 200, "payload": FeedbackReportSerializer(report).data},
+            status=status.HTTP_201_CREATED,
+        )
