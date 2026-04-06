@@ -16,6 +16,7 @@ from django.views.generic import View
 from django.db.models import F, Q
 from django.db import close_old_connections
 from django.contrib.auth.models import User
+from rest_framework.exceptions import APIException
 from applications.academic_information.models import Student
 from applications.globals.models import ExtraInfo, HoldsDesignation, Designation
 from django.shortcuts import get_object_or_404
@@ -1145,14 +1146,18 @@ def handle_add_reg(request):
     message="Your registeration request has been accepted"
 
 
-class CentralMessServiceError(Exception):
+class CentralMessServiceError(APIException):
     """Base service-level exception for central mess API flows."""
 
+    status_code = 400
+    default_detail = "Central mess operation failed."
+    default_code = "central_mess_error"
+
     def __init__(self, message, *, status_code=400, payload=None):
-        super().__init__(message)
         self.message = message
         self.status_code = status_code
         self.payload = payload or {}
+        super().__init__(detail=message)
 
 
 class RebateOverlapError(CentralMessServiceError):

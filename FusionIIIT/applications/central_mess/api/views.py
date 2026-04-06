@@ -299,7 +299,12 @@ class RebateApi(APIView):
             try:
                 create_rebate(serializer.validated_data, request_user=request.user)
             except RebateOverlapError as exc:
-                return Response(exc.payload or {'message': exc.message})
+                return Response(
+                    exc.payload or {'message': exc.message},
+                    status=exc.status_code,
+                )
+            except CentralMessServiceError as exc:
+                return Response({'error': str(exc)}, status=exc.status_code)
             return Response({'status': 200})
         return Response(serializer.errors, status=400)
 
