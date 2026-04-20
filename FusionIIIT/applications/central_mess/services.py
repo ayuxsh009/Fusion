@@ -1,5 +1,7 @@
 import hashlib
 import json
+import sys
+import calendar
 from django.conf import settings
 from django.core.exceptions import ObjectDoesNotExist
 from datetime import date, datetime
@@ -93,6 +95,22 @@ COMMITTEE_OR_CONVENER_DESIGNATIONS = {
 PAYMENT_GRACE_DAYS = 10
 PAYMENT_ESCALATION_DAYS = 30
 DEFAULT_LATE_FEE = 100
+APPROVED_REBATE_STATUSES = {"2", "approved", "accept", "accepted"}
+MONTH_NAME_TO_NUMBER = {
+    "january": 1,
+    "february": 2,
+    "march": 3,
+    "april": 4,
+    "may": 5,
+    "june": 6,
+    "july": 7,
+    "august": 8,
+    "september": 9,
+    "october": 10,
+    "november": 11,
+    "december": 12,
+}
+MONTH_NUMBER_TO_NAME = {value: key.title() for key, value in MONTH_NAME_TO_NUMBER.items()}
 
 
 def _designation_names_for_user(user):
@@ -230,6 +248,20 @@ def _notify_users(event_type, recipients, message, *, actor_user=None, channels=
         if actor_user is not None and getattr(actor_user, "is_authenticated", False)
         else None
     )
+
+    force_sync = bool(getattr(settings, "CENTRAL_MESS_SYNC_NOTIFICATIONS", False))
+    if "test" in sys.argv:
+        force_sync = True
+    if force_sync:
+        _notify_users_sync(
+            event_type=event_type,
+            recipient_user_ids=recipient_user_ids,
+            message=message,
+            actor_user_id=actor_user_id,
+            channels=channels,
+            retries=retries,
+        )
+        return
 
     def _dispatch():
         worker = Thread(
@@ -894,37 +926,83 @@ def Calculate_rebate(id, month_previous, amount_per_day):
     return rebate_amount
             
 
-def generate_bill():
-    
-    per_day_cost_obj = MessBillBase.objects.latest('timestamp')
-    per_day_cost = per_day_cost_obj.bill_amount
-    print(per_day_cost)
-    amount = int(last_day_prev_month.day) * int(per_day_cost)
-    print(amount)
-    student_all = Reg_main.objects.filter(current_mess_status = "Registered")
-    print(student_all)
-    for student in student_all:
-        student_id = student.student_id
-        rem_balance = student.balance
-        try:        
-            monthly_bill_obj = Monthly_bill.objects.get(student_id=student_id, month=previous_month, year=previous_month_year)
-            rebate_count_count = monthly_bill_obj.rebate_count
-            rebate_amount = int(rebate_count_count)*int(per_day_cost)
-            monthly_bill_obj.rebate_amount = rebate_amount
-            total_bill = amount - rebate_amount
-            monthly_bill_obj.total_bill = total_bill
-            rem_balance = rem_balance - total_bill
-            student.balance = rem_balance
-            monthly_bill_obj.amount = amount
-            monthly_bill_obj.save()
-        except:
-            new_monthly_bill_obj = Monthly_bill(student_id=student_id, month=previous_month, year=previous_month_year, amount=amount, total_bill=amount)
-            rem_balance = rem_balance - amount
-            student.balance = rem_balance
-            new_monthly_bill_obj.save()
-        if(student.balance <= 0):
-            student.current_mess_status = 'Deregistered'
-        student.save()
+def generate_bill(billing_month=None, base_rate=None, special_charges=0):
+    """
+    Generate monthly bills for all currently registered students.
+
+    WF-103 integration note:
+    This function computes rebate days at generation time from approved rebate
+    entries only, so it should be scheduled after rebate approvals are reviewed.
+    """
+    if base_rate is None:
+        per_day_cost_obj = MessBillBase.objects.order_by("-timestamp").first()
+        if per_day_cost_obj is None:
+            raise CentralMessServiceError(
+                "Mess bill base is not configured. Please set bill_amount before bill generation.",
+                status_code=400,
+            )
+        base_rate = per_day_cost_obj.bill_amount
+
+    if billing_month is None:
+        first_day_current_month = date.today().replace(day=1)
+        previous_month_end = first_day_current_month - timedelta(days=1)
+        billing_month = f"{previous_month_end.year:04d}-{previous_month_end.month:02d}"
+
+    normalized_billing_month, month_start, _, _ = _parse_billing_month(billing_month)
+    month_label = month_start.strftime("%B")
+    year_label = month_start.year
+    base_rate = _coerce_non_negative_int(base_rate, "base_rate")
+    special_charges = _coerce_non_negative_int(special_charges, "special_charges")
+
+    processed_count = 0
+    registered_students = Reg_main.objects.select_related("student_id").filter(
+        current_mess_status="Registered"
+    )
+
+    for reg_entry in registered_students:
+        student = reg_entry.student_id
+        previous_balance = max(0, -(reg_entry.balance or 0))
+        bill_summary = calculate_monthly_bill_with_approved_rebates(
+            student_id=student,
+            billing_month=normalized_billing_month,
+            base_rate=base_rate,
+            special_charges=special_charges,
+            previous_balance=previous_balance,
+        )
+
+        generated_on = date.today()
+        due_date = generated_on + timedelta(days=PAYMENT_GRACE_DAYS)
+
+        Monthly_bill.objects.update_or_create(
+            student_id=student,
+            month=month_label,
+            year=year_label,
+            defaults={
+                "amount": bill_summary["base_amount"],
+                "rebate_count": bill_summary["rebate_days"],
+                "rebate_amount": base_rate * bill_summary["rebate_days"],
+                "total_bill": bill_summary["total_bill"],
+                "generated_on": generated_on,
+                "due_date": due_date,
+                "paid": False,
+            },
+        )
+
+        monthly_charge = bill_summary["base_amount"] + bill_summary["special_charges"]
+        reg_entry.balance = (reg_entry.balance or 0) - monthly_charge
+        if reg_entry.balance <= 0:
+            reg_entry.current_mess_status = "Deregistered"
+            reg_entry.save(update_fields=["balance", "current_mess_status"])
+        else:
+            reg_entry.save(update_fields=["balance"])
+        processed_count += 1
+
+    _log_audit(
+        "monthly_bill_generated_bulk",
+        "Monthly_bill",
+        details=f"billing_month={normalized_billing_month}, processed={processed_count}",
+    )
+    return processed_count
         
 
 
@@ -1255,12 +1333,248 @@ def update_menu_items(mess_option, items, *, request_user=None):
     )
 
 
-def create_monthly_bill(validated_data):
+def _parse_billing_month(billing_month):
+    raw = str(billing_month or "").strip()
+    try:
+        parsed = datetime.strptime(raw, "%Y-%m").date()
+    except ValueError:
+        raise CentralMessServiceError(
+            "billing_month must be in YYYY-MM format.",
+            status_code=400,
+        )
+
+    days_in_month = calendar.monthrange(parsed.year, parsed.month)[1]
+    month_start = date(parsed.year, parsed.month, 1)
+    month_end = date(parsed.year, parsed.month, days_in_month)
+    normalized = f"{parsed.year:04d}-{parsed.month:02d}"
+    return normalized, month_start, month_end, days_in_month
+
+
+def _coerce_non_negative_int(value, field_name):
+    if value is None or value == "":
+        return 0
+    try:
+        coerced = int(value)
+    except (TypeError, ValueError):
+        raise CentralMessServiceError(
+            f"{field_name} must be a valid integer.",
+            status_code=400,
+        )
+    if coerced < 0:
+        raise CentralMessServiceError(
+            f"{field_name} cannot be negative.",
+            status_code=400,
+        )
+    return coerced
+
+
+def _build_billing_month_from_month_year(month, year):
+    month_raw = str(month or "").strip().lower()
+    month_number = MONTH_NAME_TO_NUMBER.get(month_raw)
+    if month_number is None:
+        raise CentralMessServiceError(
+            "month must be a valid calendar month name.",
+            status_code=400,
+        )
+    try:
+        year_int = int(year)
+    except (TypeError, ValueError):
+        raise CentralMessServiceError("year must be a valid integer.", status_code=400)
+    return f"{year_int:04d}-{month_number:02d}"
+
+
+def _approved_rebate_status_filter():
+    approved = Q()
+    for value in APPROVED_REBATE_STATUSES:
+        approved |= Q(status__iexact=value)
+    return approved
+
+
+def fetch_approved_rebate_ranges_for_month(student, billing_month):
+    _, month_start, month_end, _ = _parse_billing_month(billing_month)
+    rebates = (
+        Rebate.objects.filter(
+            student_id=student,
+            start_date__lte=month_end,
+            end_date__gte=month_start,
+        )
+        .filter(_approved_rebate_status_filter())
+        .only("start_date", "end_date")
+    )
+
+    ranges = []
+    for rebate in rebates:
+        start_date = max(rebate.start_date, month_start)
+        end_date = min(rebate.end_date, month_end)
+        if end_date >= start_date:
+            ranges.append((start_date, end_date))
+    return ranges
+
+
+def _merge_date_ranges(date_ranges):
+    if not date_ranges:
+        return []
+
+    sorted_ranges = sorted(date_ranges, key=lambda value: value[0])
+    merged = [list(sorted_ranges[0])]
+
+    for start_date, end_date in sorted_ranges[1:]:
+        last_start, last_end = merged[-1]
+        if start_date <= (last_end + timedelta(days=1)):
+            if end_date > last_end:
+                merged[-1][1] = end_date
+        else:
+            merged.append([start_date, end_date])
+
+    return [(start_date, end_date) for start_date, end_date in merged]
+
+
+def _count_days_from_ranges(date_ranges):
+    return sum((end_date - start_date).days + 1 for start_date, end_date in date_ranges)
+
+
+def _calculate_monthly_bill_values(
+    *,
+    days_in_month,
+    rebate_days,
+    base_rate,
+    special_charges,
+    previous_balance,
+):
+    normalized_rebate_days = max(0, min(rebate_days, days_in_month))
+    effective_days = max(0, days_in_month - normalized_rebate_days)
+    base_amount = base_rate * effective_days
+    total_bill = base_amount + special_charges + previous_balance
+    return normalized_rebate_days, base_amount, total_bill
+
+
+def calculate_monthly_bill_with_approved_rebates(
+    *,
+    student_id,
+    billing_month,
+    base_rate,
+    special_charges=0,
+    previous_balance=0,
+):
+    student = student_id
+    if not isinstance(student_id, Student):
+        student = Student.objects.select_related("id").filter(id=str(student_id).upper()).first()
+        if student is None:
+            raise CentralMessServiceError("student_id does not exist.", status_code=404)
+
+    normalized_billing_month, _, _, days_in_month = _parse_billing_month(billing_month)
+    base_rate_value = _coerce_non_negative_int(base_rate, "base_rate")
+    special_charges_value = _coerce_non_negative_int(special_charges, "special_charges")
+    previous_balance_value = _coerce_non_negative_int(previous_balance, "previous_balance")
+
+    rebate_ranges = fetch_approved_rebate_ranges_for_month(student, normalized_billing_month)
+    merged_ranges = _merge_date_ranges(rebate_ranges)
+    rebate_days = _count_days_from_ranges(merged_ranges)
+
+    rebate_days, base_amount, total_bill = _calculate_monthly_bill_values(
+        days_in_month=days_in_month,
+        rebate_days=rebate_days,
+        base_rate=base_rate_value,
+        special_charges=special_charges_value,
+        previous_balance=previous_balance_value,
+    )
+
+    return {
+        "student_id": str(student.id_id),
+        "billing_month": normalized_billing_month,
+        "days_in_month": days_in_month,
+        "rebate_days": rebate_days,
+        "base_amount": base_amount,
+        "special_charges": special_charges_value,
+        "previous_balance": previous_balance_value,
+        "total_bill": total_bill,
+    }
+
+
+def create_monthly_bill(validated_data, *, request_user=None):
+    if request_user is not None:
+        _require_designation(
+            request_user,
+            MANAGER_DESIGNATIONS.union(WARDEN_DESIGNATIONS),
+            allow_staff=False,
+        )
+
     payload = dict(validated_data)
-    amount = payload.get("amount", 0)
-    rebate_count = payload.get("rebate_count", 0)
-    rebate_amount = payload.get("rebate_amount", 0)
-    total_bill = amount - (rebate_count * rebate_amount)
+    payload["student_id"] = _get_student(payload, request_user=request_user)
+
+    billing_month = payload.get("billing_month")
+    if billing_month:
+        normalized_billing_month, month_start, _, _ = _parse_billing_month(billing_month)
+    else:
+        normalized_billing_month = _build_billing_month_from_month_year(
+            payload.get("month"),
+            payload.get("year"),
+        )
+        _, month_start, _, _ = _parse_billing_month(normalized_billing_month)
+
+    payload["month"] = MONTH_NUMBER_TO_NAME[month_start.month]
+    payload["year"] = month_start.year
+
+    today = date.today()
+    is_current_cycle = (
+        payload["month"] == today.strftime("%B")
+        and payload["year"] == today.year
+    )
+    is_existing_bill = Monthly_bill.objects.filter(
+        student_id=payload["student_id"],
+        month=payload["month"],
+        year=payload["year"],
+    ).exists()
+    if is_current_cycle and today.day != 1 and not is_existing_bill:
+        raise CentralMessServiceError(
+            "Current-month bill generation is allowed only on the 1st day of the month.",
+            status_code=400,
+        )
+
+    use_br_mms_003_formula = (
+        payload.get("base_rate") is not None
+        or payload.get("billing_month") is not None
+        or payload.get("special_charges") is not None
+        or payload.get("previous_balance") is not None
+    )
+
+    if use_br_mms_003_formula:
+        if payload.get("base_rate") is None:
+            raise CentralMessServiceError(
+                "base_rate is required when using billing_month-based bill calculation.",
+                status_code=400,
+            )
+
+        bill_summary = calculate_monthly_bill_with_approved_rebates(
+            student_id=payload["student_id"],
+            billing_month=normalized_billing_month,
+            base_rate=payload.get("base_rate"),
+            special_charges=payload.get("special_charges", 0),
+            previous_balance=payload.get("previous_balance", 0),
+        )
+        amount = bill_summary["base_amount"]
+        rebate_count = bill_summary["rebate_days"]
+        rebate_amount = _coerce_non_negative_int(payload.get("base_rate"), "base_rate") * rebate_count
+        total_bill = bill_summary["total_bill"]
+    else:
+        amount = _coerce_non_negative_int(payload.get("amount", 0), "amount")
+        rebate_count = _coerce_non_negative_int(payload.get("rebate_count", 0), "rebate_count")
+        rebate_amount = _coerce_non_negative_int(payload.get("rebate_amount", 0), "rebate_amount")
+        total_bill = amount - (rebate_count * rebate_amount)
+        if total_bill < 0:
+            total_bill = 0
+        days_in_month = calendar.monthrange(payload["year"], month_start.month)[1]
+        bill_summary = {
+            "student_id": str(payload["student_id"].id_id),
+            "billing_month": normalized_billing_month,
+            "days_in_month": days_in_month,
+            "rebate_days": min(days_in_month, rebate_count),
+            "base_amount": amount,
+            "special_charges": 0,
+            "previous_balance": 0,
+            "total_bill": total_bill,
+        }
+
     generated_on = payload.get("generated_on") or date.today()
     due_date = payload.get("due_date") or (generated_on + timedelta(days=PAYMENT_GRACE_DAYS))
 
@@ -1284,7 +1598,11 @@ def create_monthly_bill(validated_data):
         obj.id,
         details=f"total_bill={obj.total_bill}, due_date={obj.due_date}",
     )
-    return obj
+    bill_summary["student_id"] = str(payload["student_id"].id_id)
+    bill_summary["record_id"] = obj.id
+    bill_summary["month"] = obj.month
+    bill_summary["year"] = obj.year
+    return bill_summary
 
 
 def create_rebate(validated_data, *, request_user):
@@ -2326,6 +2644,12 @@ def create_announcement(validated_data, *, request_user):
         "Announcement",
         announcement.id,
         actor=request_user,
+    )
+    _notify_users(
+        "announcement_created",
+        _get_users_by_designations({"student"}),
+        f"New mess announcement: {announcement.title}",
+        actor_user=request_user,
     )
     return announcement
 

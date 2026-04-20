@@ -16,6 +16,7 @@ def generate_mess_bill():
     """
     Celery periodic task: generate monthly mess bills for all registered students.
     Should be scheduled to run on the 1st of each month via CELERY_BEAT_SCHEDULE.
+    Run this after rebate approvals for the target billing month are finalized.
     """
     generate_bill()
 

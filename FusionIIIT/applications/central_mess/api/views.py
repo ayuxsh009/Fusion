@@ -139,6 +139,7 @@ from .serializers import (
 )
 
 MANAGEMENT_READ_ROLES = {"mess_manager", "mess_warden", "mess_admin"}
+OPERATIONAL_READ_ROLES = {"mess_manager", "mess_warden"}
 
 
 def _designation_set(user):
@@ -240,8 +241,14 @@ class Monthly_billApi(APIView):
     def post(self, request):
         serializer = Monthly_billSerializer(data=request.data)
         if serializer.is_valid():
-            create_monthly_bill(serializer.validated_data)
-            return Response({'status': 200})
+            try:
+                bill_summary = create_monthly_bill(
+                    serializer.validated_data,
+                    request_user=request.user,
+                )
+            except CentralMessServiceError as exc:
+                return Response({'error': str(exc)}, status=exc.status_code)
+            return Response({'status': 200, 'payload': bill_summary})
         return Response(serializer.errors, status=400)
 
 
@@ -433,8 +440,8 @@ class Get_Filtered_Students(APIView):
             request.user,
             endpoint="/mess/api/get_mess_students/",
             method="POST",
-            allowed_designations=MANAGEMENT_READ_ROLES,
-            allow_staff=True,
+            allowed_designations=OPERATIONAL_READ_ROLES,
+            allow_staff=False,
         )
         req_type = request.data.get('type')
 
@@ -466,8 +473,8 @@ class Get_Reg_Records(APIView):
             request.user,
             endpoint="/mess/api/get_reg_records/",
             method="GET",
-            allowed_designations=MANAGEMENT_READ_ROLES,
-            allow_staff=True,
+            allowed_designations=OPERATIONAL_READ_ROLES,
+            allow_staff=False,
         )
         student_id = request.GET.get('student_id')
         reg_record = get_reg_records_queryset(student=student_id)
@@ -483,8 +490,8 @@ class Get_Student_bill(APIView):
             request.user,
             endpoint="/mess/api/get_student_bill/",
             method="POST",
-            allowed_designations=MANAGEMENT_READ_ROLES,
-            allow_staff=True,
+            allowed_designations=OPERATIONAL_READ_ROLES,
+            allow_staff=False,
         )
         student = request.data.get('student_id')
         bill_details = get_monthly_bill_queryset(student=student)
@@ -499,8 +506,8 @@ class Get_Student_Payments(APIView):
             request.user,
             endpoint="/mess/api/get_student_payment/",
             method="POST",
-            allowed_designations=MANAGEMENT_READ_ROLES,
-            allow_staff=True,
+            allowed_designations=OPERATIONAL_READ_ROLES,
+            allow_staff=False,
         )
         student = request.data.get('student_id')
         payment_details = get_payments_queryset(student=student)
@@ -515,8 +522,8 @@ class Get_Student_Details(APIView):
             request.user,
             endpoint="/mess/api/get_student_all_details/",
             method="POST",
-            allowed_designations=MANAGEMENT_READ_ROLES,
-            allow_staff=True,
+            allowed_designations=OPERATIONAL_READ_ROLES,
+            allow_staff=False,
         )
         student = request.data.get('student_id')
         try:

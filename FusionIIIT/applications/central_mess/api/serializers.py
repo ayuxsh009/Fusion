@@ -71,14 +71,52 @@ class MessBillBaseSerializer(serializers.ModelSerializer):
 
 
 class Monthly_billSerializer(serializers.ModelSerializer):
+    billing_month = serializers.CharField(required=False, write_only=True)
+    base_rate = serializers.IntegerField(required=False, write_only=True)
+    special_charges = serializers.IntegerField(required=False, write_only=True)
+    previous_balance = serializers.IntegerField(required=False, write_only=True)
+
     class Meta:
         model = Monthly_bill
         fields = "__all__"
+        validators = []
 
     def validate_amount(self, value):
         if value < 0:
             raise serializers.ValidationError("amount cannot be negative.")
         return value
+
+    def _validate_billing_month(self, value):
+        raw = str(value or "").strip()
+        parts = raw.split("-")
+        if len(parts) != 2 or not parts[0].isdigit() or not parts[1].isdigit():
+            raise serializers.ValidationError("billing_month must be in YYYY-MM format.")
+        month = int(parts[1])
+        if month < 1 or month > 12:
+            raise serializers.ValidationError("billing_month month must be between 01 and 12.")
+
+    def validate(self, attrs):
+        formula_mode = any(
+            key in attrs for key in ("billing_month", "base_rate", "special_charges", "previous_balance")
+        )
+        if formula_mode:
+            if attrs.get("base_rate") is None:
+                raise serializers.ValidationError(
+                    {"base_rate": "base_rate is required for formula-based monthly billing."}
+                )
+            if attrs.get("billing_month"):
+                self._validate_billing_month(attrs.get("billing_month"))
+            elif not attrs.get("month") or attrs.get("year") is None:
+                raise serializers.ValidationError(
+                    "Provide either billing_month or both month and year for formula-based monthly billing."
+                )
+
+        for field in ("base_rate", "special_charges", "previous_balance"):
+            value = attrs.get(field)
+            if value is not None and value < 0:
+                raise serializers.ValidationError({field: f"{field} cannot be negative."})
+
+        return attrs
 
 
 class PaymentsSerializer(serializers.ModelSerializer):
